@@ -3,8 +3,9 @@
 
 #include <stdint.h>
 
-#define MAX_PLACE_BLOCK_DATA 100 // TODO update to real value
-#define MAX_OUTER_FACE_REQUIREMENT 300 // TODO update to real value
+// sized to map 1's largest gamepiece. data/map1_gamepieces.h static asserts that its data fits
+#define MAX_PLACE_BLOCK_DATA 8 // most blocks in any gamepiece
+#define MAX_OUTER_FACE_REQUIREMENT 26 // most outward buildable faces in any gamepiece_rot
 
 // grid width in x, y and z. lives here so the grid (cell_index) and the precomputed deltas
 // always use the same dims
@@ -15,21 +16,27 @@
 // bit 0 of a grid cell: 1 = filled. empty cells are all 0 (EMPTY_BLOCK)
 #define FILLED_BIT 1
 
+// grid offset for a (dx, dy, dz) offset, since
+// cell_index(x + dx, y + dy, z + dz) = cell_index(x, y, z) + dx + GX*dy + GX*GY*dz
+// a macro (not a function) so the generated gamepiece data can use it in static initializers,
+// which keeps every delta matched to the grid's dims
+#define GRID_DELTA(dx, dy, dz) ((dx) + GX * (dy) + GX * GY * (dz))
+
 static inline int32_t grid_delta(int32_t dx, int32_t dy, int32_t dz){
-    // grid offset for a (dx, dy, dz) offset, since
-    // cell_index(x + dx, y + dy, z + dz) = cell_index(x, y, z) + dx + GX*dy + GX*GY*dz
-    // the precompute should build every delta with this, so they match the grid's dims
-    return dx + GX * dy + GX * GY * dz;
+    return GRID_DELTA(dx, dy, dz);
 }
 
 typedef struct{
     // grid offset from gamepiece origin
     // NOT a (x, y, z) interpretable 3d position; Its an offset in the
-    // grid array convention. built with grid_delta
+    // grid array convention. built with GRID_DELTA
     int32_t delta;
     // value written into grid: bit packed faces (bits 1-12).
     // FILLED_BIT is OR'd in when placed, so the precompute doesn't need to set it
     uint16_t cell;
+    // BlockData.BlockType: Farm=0, House=1, Water=2, Ground=3, Windmill=4, Tower=5, Blank=6. for scoring.
+    // fits in the struct's padding, so it costs no memory
+    uint8_t block_type;
 } PlaceBlockData;
 
 typedef struct{
@@ -53,7 +60,7 @@ typedef struct{
     uint8_t n_cubes; // number cubes in a gamepiece_rot
     PlaceBlockData place_blocks[MAX_PLACE_BLOCK_DATA];
 
-    uint16_t n_out; // number of outward buildable faces. uint16_t since MAX_OUTER_FACE_REQUIREMENT > 255
+    uint16_t n_out; // number of outward buildable faces
     // every outward buildable face of the gamepiece_rot. Checked for validity,
     // and used to add new frontier cells after placing
     Outer_data outer[MAX_OUTER_FACE_REQUIREMENT];

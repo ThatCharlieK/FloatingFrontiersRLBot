@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "gamepiece_data.h"
+#include "gamepiece_lookup.h"
 
 /*
 The main performance object is, from the current gamestate,
@@ -21,6 +22,18 @@ This requires:
 Thus the engine needs:
 - Fast access to any place on the grid
 - Fast access to the face type for any given face
+
+For each of the ~50 gamepiece
+gamepiece_data[id][rot (0-3)] holds a gamepiece_rot (see gamepiece_data.h):
+     - type of each block
+     - delta offsets for each block
+     - delta offsets for each outer buildable face, used for validity and new frontier blocks
+the 3d indexing formula is setup so that:
+     idx(x + dx, y + dy, z + dz) = idx(x, y, z) + precomputed constant,
+     based based on grid size and width
+Thus adding a piece to the grid of checking overlaps is just checking:
+     grid[base_game_piece + per_block_delta]
+where per_block_delta is precomputed
 */
 
 uint32_t START_GRID_SIZE = GX * GY * GZ;
@@ -43,7 +56,6 @@ const uint16_t EMPTY_BLOCK = 0; // convention for empty blocks: all zero, so a c
 #define TRIED_BITS 14
 #define TRIED_SIZE (1 << TRIED_BITS)
 
-const uint16_t num_gamepiece = 50; // TODO fill in with true number
 
 typedef struct{
     /*
@@ -83,18 +95,6 @@ typedef struct{
     uint16_t frontier_len; // number of elements in frontier, which is also the next free slot
     uint16_t* frontier_pos;
 
-    // For each of the ~50 gamepiece
-    // gamepiece_data[id][rot (0-3)] holds a gamepiece_rot (see gamepiece_data.h):
-    //      - type of each block
-    //      - delta offsets for each block
-    //      - delta offsets for each outer buildable face, used for validity and new frontier blocks
-    // the 3d indexing formula is setup so that:
-    //      idx(x + dx, y + dy, z + dz) = idx(x, y, z) + precomputed constant,
-    //      based based on grid size and width
-    // Thus adding a piece to the grid of checking overlaps is just checking:
-    //      grid[base_game_piece + per_block_delta]
-    // where per_block_delta is precomputed
-    uint16_t* gamepiece_data;
 
     /*
     Dedup for get_all_valid_gamepiece_rot.
@@ -222,9 +222,9 @@ void get_all_valid_gamepiece_rot(GameState* gstate, valid_action* valid_actions,
 
     // loop order is gamepiece -> rotation -> frontier -> place block, so that within one
     // gamepiece_rot every duplicate is just a repeated origin
-    for(uint8_t gp_id = 0; gp_id < num_gamepiece; gp_id++){ // TODO: only gamepieces in hand
+    for(uint8_t gp_id = 0; gp_id < get_num_gamepieces(); gp_id++){ // TODO: only gamepieces in hand
         for(uint8_t rot = 0; rot < 4; rot++){
-            gamepiece_rot* cur_gp_rot = NULL; // TODO: lookup gamepiece_data[gp_id][rot]
+            gamepiece_rot* cur_gp_rot = get_gamepiece_rot(gp_id, rot);
             gstate->tried_pass++; // new pass: forget the origins tried for the previous gamepiece_rot
 
             // loop over frontier
