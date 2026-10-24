@@ -1,4 +1,8 @@
 #include <stdio.h>
+#include <stdint.h>
+
+#include "gamepiece_data.h"
+
 /*
 The main performance object is, from the current gamestate,
 quickly extra all valid [GamepieceID, x, y, z, rot] placement actions.
@@ -20,58 +24,289 @@ Thus the engine needs:
 - Fast access to the face type for any given face
 */
 
-uint32_t start_grid_size = 100;
-uint32_t start_frontier_size = 100000
+// grid width in x, y and z, used by cell_index
+#define GX 1000
+#define GY 1000
+#define GZ 1000
+
+uint32_t START_GRID_SIZE = GX * GY * GZ;
+uint32_t START_FRONTIER_SIZE = 100000;
+uint32_t MAX_VALID_GP_ROT = 100000; // generous upper bound for total max valid actions
+const uint16_t EMPTY_BLOCK = 1; // convention for empty blocks: bit 0 set, filled blocks always have bit 0 clear
+
+// face types, as stored in the grid and in Outer_data.face
+#define FACE_CAN_BE_BUILT_ON 0      // 00
+#define FACE_CANT_BE_BUILT_ON 1     // 01
+#define FACE_REQUIRED_TO_BUILD_ON 2 // 10
+
+// frontier_pos value for a cell that isn't in the frontier
+#define NOT_IN_FRONTIER UINT16_MAX
+
+const uint16_t num_gamepiece = 50; // TODO fill in with true number
 
 typedef struct{
     /*
     grid[x, y, z] is an array of all placed blocks.
-
-    Each spot in the grid is a uint16_t int that represents the block at that spot (inclusive):
-    bytes 0-1: +X face
-    bytes 2-3: -X face
-    bytes 4-5: +Y face
-    bytes 6-7: -Y face
-    bytes 8-9: +Z face
-    bytes 10-11: -Z face 
+    Each element is a uint16_t that represents the different face types of the block at that spot (inclusive):
+    bit 0: empty flag. 1 = empty (EMPTY_BLOCK), 0 = filled
+    bytes 1-2: +X face
+    bytes 3-4: -X face
+    bytes 5-6: +Y face
+    bytes 7-8: -Y face
+    bytes 9-10: +Z face
+    bytes 11-12: -Z face
 
     Each face gets 2 bytes, because the face is one of the four face types:
     00: FaceCanBeBuiltOn - for when face has full validity to be used as anything
-    01: FaceCannotTouch:                     for when no faces can touch - e.g for the top of a house
-    10: FaceCanTouchButCantBeBuiltOn:        for when two faces can touch but can't be used to build on
-    11: RequiredToBuildOn                    for when this face MUST be used to build on (e.g. the bottom of a house).
+    01: FaceCanTouchButCantBeBuiltOn:        for when two faces can touch but can't be used to build on
+    10: RequiredToBuildOn                    for when this face MUST be used to build on (e.g. the bottom of a house).
 
     The real game also has FaceIsInsideGamepiece, but since I only track the frontier, and never undo, this is unneccessary
 
-    grid starts at a fixed size and grows if it overlaps
+    grid starts at a fixed size and grows if it overlaps.
     */
-    uint16_t grid*;
+    uint16_t* grid;
 
     /*
-    the "frontier" is the list of the indexes in grid
-    that are empty blocks that have a connection to FaceCanBeBuiltOn face, ie all
-    the empty blocks that you might be able to place a new gamepiece at
-    The coordinates of each frontier is laid out as:
-    bytes 0-9:   x coord
-    bytes 10-19: y coord
-    bytes 20-29: z coord
-    bytes 30-32: empty
+    frontier:
+        Contiguous arr of indexes in grid of grid spots that are on the frontier.
+        Records all empty indexes in grid that could be built on
+    frontier_pos:
+        Same size as grid. frontier_pos[cell_index(pos)] gives the index of *frontier*
+        where that grid would live. For most cells this is NOT_IN_FRONTIER.
+        
     */
-    uint32_t frontier[start_frontier_size];
-    uint16_t last;
-
-    /*
-    I loop over frontier frequently so I need a way to remove from frontier:
-    1) If I were to add an block at grid pos (x, y, z) to position n in frontier, I set:
-        frontier_pos[x * y * z] = n
-    2) To remove a block from the frontier, get the index of the block in frontier, then swap
-        it with the end of the frontier, so theres no gaping holes. Then make the subtract the counter to the end:
-            f_idx = fronter_pos[x * y * z]
-            frontier[f_idx] = frontier[last]
-            last--;
-    */
+    uint32_t* frontier;
+    uint16_t frontier_last; // index of last filled element in frontier
     uint16_t* frontier_pos;
-    uint16_t last;
+
+    // For each of the ~50 gamepiece
+    // gamepiece_data[id][rot (0-3)] holds
+    //      - type of each block
+    //      - delta offsets for each block
+    //      - delta offsets for each empty block that could be added to frontier
+    // the 3d indexing formula is setup so that:
+    //      idx(x + dx, y + dy, z + dz) = idx(x, y, z) + precomputed constant,
+    //      based based on grid size and width
+    // Thus adding a piece to the grid of checking overlaps is just checking:
+    //      grid[base_game_piece + per_block_delta]
+    // where per_block_delta is precomputed
+    uint16_t* gamepiece_data;
+
+} GameState;
+
+// game state helpers
+
+GameState* init_GameState(){
+    // initilize a game state with the starter list lengths
+    GameState* game_state = (GameState*) Malloc(sizeof(game_state));
+
+    // initilize large starter grid
+    // TODO: implement dynamic growing if bounds are exceeded, but 1000 is good enough for now
+    game_state -> grid = Malloc(sizeof(uint16_t) * START_GRID_SIZE);
+    game_state -> frontier_pos = Malloc(sizeof(uint16_t) * START_GRID_SIZE); // same dims as grid
+    for(uint32_t i = 0; i < START_GRID_SIZE; i++){
+        game_state -> grid[i] = EMPTY_BLOCK;
+        game_state -> frontier_pos[i] = NOT_IN_FRONTIER;
+    }
+
+    // initilize 
+    game_state -> frontier = Malloc(sizeof(uint16_t) * START_FRONTIER_SIZE);
+    game_state -> frontier_last = 0;
+}
+
+uint32_t cell_index(uint16_t x_pos3d, uint16_t y_pos3d, uint16_t z_pos3d){
+    // TODO compute using below formula
+    // cell_index(x, y, z) = x + GX * y + GX*GY * z
+    // for GX, GY constants that are the grid's width in x and y
     
 
-} GameState 
+    // cell_index(x + dx, y + dy, z + dz) = cell_index(x, y, z) + dx + GX*dy + GX*GY*dz
+    return x_pos3d + GX * y_pos3d + GX * GY * z_pos3d;
+}
+
+uint_8_t get_face(uint16_t block_in_grid, uint8_t dir){
+    // extract the face type from a block in the grid
+    // that the Outer_data's dir wanted.
+    // dir follows the grid's bit layout: 0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z,
+    // so each face lives at bits 1+2*dir and 2+2*dir (bit 0 is the empty flag). Shifting replaces the switch.
+    return (block_in_grid >> (1 + 2 * dir)) & 0x3;
+}
+
+uint8_t is_valid_gp_rot_placement(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_base_idx){
+    // check if the gamepiece and its rotation is valid to be placed
+    // with the origin being at gp_base_pos
+
+    // check if the piece's blocks overlap with any placed blocks
+    for(int i = 0; i < gp_rot->n_cubes; i++){
+        int32_t block_delta = gp_rot->place_blocks[i].delta;
+        int32_t grid_pos = gp_base_idx + block_delta;
+        if(gstate-> grid[grid_pos] != EMPTY_BLOCK){
+            return 0; // invalid
+        }
+    }
+
+    // check that all outer requirements are satisfied
+    int8_t has_buildable_face = 0;
+    for(int j = 0; j < gp_rot->n_out; j++){
+        Outer_data outer_data = gp_rot->outer[j];
+        int32_t grid_pos = gp_base_idx + outer_data.delta;
+        uint16_t neighbor = gstate->grid[grid_pos];
+
+        // a connection is our (buildable) face touching a buildable face of a placed block.
+        // the neighbor's touching face is on the opposite side: dir ^ 1 (+X <-> -X, etc.)
+        if(neighbor != EMPTY_BLOCK && get_face(neighbor, outer_data.dir ^ 1) != FACE_CANT_BE_BUILT_ON){
+            has_buildable_face = 1;
+        }
+        // if a required face has no connection, return invalid
+        else if(outer_data.face == FACE_REQUIRED_TO_BUILD_ON){
+            return 0;
+        }
+    }
+
+    // need at least one connection to the city
+    return has_buildable_face;
+}
+
+valid_action convert_to_valid_action(uint8_t gp_id, uint8_t rot, int32_t gp_base_pos){
+    // convert a gamepiece id, a rotation, and position
+    // return a valid_action
+    // gp_base_pos is a grid index, so undo cell_index to get back (x, y, z)
+    valid_action action;
+    action.gp_id = gp_id;
+    action.rot = rot;
+    action.x = gp_base_pos % GX;
+    action.y = (gp_base_pos / GX) % GY;
+    action.z = gp_base_pos / (GX * GY);
+    return action;
+}
+
+/*
+Dedup for get_all_valid_gamepiece_rot.
+The same origin gets reached from several (frontier cell, place block) pairs, so for each
+gamepiece_rot we track the origins already tried in a small open addressing hash set.
+Each slot stores the origin itself, so two different origins hashing to the same slot don't collide.
+A slot only counts as occupied if its stamp == tried_pass, so starting a new gamepiece_rot is
+just tried_pass++ instead of clearing the whole table.
+TRIED_SIZE must stay well above (frontier size * n_cubes), or probing slows down (and loops forever if full).
+*/
+#define TRIED_BITS 16
+#define TRIED_SIZE (1 << TRIED_BITS)
+static int32_t tried_key[TRIED_SIZE];
+static uint32_t tried_stamp[TRIED_SIZE];
+static uint32_t tried_pass = 0; // incremented before each use, so the first pass is 1 and the zeroed stamps read as empty
+
+uint8_t already_tried(int32_t origin){
+    // returns 1 if origin was already tried this pass, otherwise marks it as tried and returns 0
+    uint32_t slot = ((uint32_t)origin * 2654435761u) >> (32 - TRIED_BITS); // multiplicative hash
+    while(tried_stamp[slot] == tried_pass){
+        if(tried_key[slot] == origin) return 1;
+        slot = (slot + 1) & (TRIED_SIZE - 1); // linear probe
+    }
+    tried_stamp[slot] = tried_pass;
+    tried_key[slot] = origin;
+    return 0;
+}
+
+valid_action* get_all_valid_gamepiece_rot(GameState* gstate){
+    // the most perf. intensive function
+    // Gets all valid gamepiec_rot combinations and the position of their origin block
+    // return pointer to heap allocated gamepiece rotation list
+
+    valid_action* valid_actions = Malloc(sizeof(valid_action) * MAX_VALID_GP_ROT);
+    int valid_actions_idx = 0;
+
+
+    // loop order is gamepiece -> rotation -> frontier -> place block, so that within one
+    // gamepiece_rot every duplicate is just a repeated origin
+    for(uint8_t gp_id = 0; gp_id < num_gamepiece; gp_id++){ // TODO: only gamepieces in hand
+        for(uint8_t rot = 0; rot < 4; rot++){
+            gamepiece_rot* cur_gp_rot = NULL; // TODO: lookup gamepiece_data[gp_id][rot]
+            tried_pass++; // new pass: forget the origins tried for the previous gamepiece_rot
+
+            // loop over frontier
+            for(int i = 0; i <= gstate->frontier_last; i++){
+                // try all combinations;
+                // loop through all place blocks of gamepiece_rot,
+                // try placing them all in the current frontier block
+                uint32_t frontier_cell = gstate->frontier[i];
+
+                for(int b = 0; b < cur_gp_rot->n_cubes; b++){
+                    // put place_blocks[b] on the frontier cell. Its grid idx is base + delta,
+                    // so the gamepiece origin is the frontier cell minus that block's delta
+                    int32_t cur_gp_rot_pos = frontier_cell - cur_gp_rot->place_blocks[b].delta;
+
+                    // skip origins this gamepiece_rot already tried from another frontier cell or place block
+                    if(already_tried(cur_gp_rot_pos)) continue;
+
+                    // check if cur_gp_rot is valid
+                    if(is_valid_gp_rot_placement(gstate, cur_gp_rot, cur_gp_rot_pos)){
+                        valid_actions[valid_actions_idx] = convert_to_valid_action(gp_id, rot, cur_gp_rot_pos);
+                        valid_actions_idx++;
+                    }
+                }
+            }
+        }
+    }
+    return valid_actions;
+}
+
+void place_gamepiece_rot(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_base_block_idx){
+    // gstate: game state
+    // gp_rot: the precomputed data for the gamepiece to place, wrt to its cur rotation
+    // gp_base_block_idx: the index into grid that the current gamepiece is at
+    
+    // Place a gamepiece with a set rotation. Assume gamepiece is valid
+    // Pulls from precompute data, does fast checks against current grid state
+
+    // loop through all blocks in the gamepiece
+    for(uint16_t i = 0; i < gp_rot -> n_cubes; i++){
+        PlaceBlockData pbd = gp_rot->place_blocks[i];
+        // from the grid indexing convention, we compute each
+        // blocks grid position as a one off delta offset from the base
+        // this pbd.delta offset is precomputed
+        uint32_t pbd_grid_idx = gp_base_block_idx + pbd.delta; // position in grid of the new block
+        
+        // fill it in in the grid
+        gstate->grid[pbd_grid_idx] = pbd.cell;
+        remove_from_frontier(gstate, pbd_grid_idx);
+    }
+    
+    // Loop through all blocks that are on the outside of the current gamepiece
+    // If they don't overlap with any block in grid, then add add it to the frontier
+    for(uint32_t i = 0; i < gp_rot->n_out; i++){
+        uint32_t outer_grid_idx = gp_base_block_idx + gp_rot->outer[i].delta;
+        if(gstate->grid[outer_grid_idx] != EMPTY_BLOCK) continue; // skip if filled
+        // skip if already in frontier (e.g. the inner corner of an L touches two outer faces)
+        if(gstate->frontier_pos[outer_grid_idx] != NOT_IN_FRONTIER) continue;
+        add_to_frontier(gstate, outer_grid_idx);
+    }
+}
+
+void add_to_frontier(GameState* gstate, uint32_t grid_idx){
+    // add the block at grid_idx to the frontier
+    // doesn't handle duplicates; caller must ensure grid_idx not in froniter
+    gstate -> frontier_last++;
+    gstate->frontier[gstate->frontier_last] = grid_idx;
+    gstate->frontier_pos[grid_idx] = gstate->frontier_last;
+}
+
+void remove_from_frontier(GameState* gstate, uint32_t grid_idx){
+    // if grid_idx was on frontier, remove it from the frontier
+    
+    // get the index in frontier that the empty block lived in
+    uint16_t frontier_idx = gstate -> frontier_pos[grid_idx];
+    if (frontier_idx == NOT_IN_FRONTIER) return; // cubes can land on cells that were never on the frontier
+
+    // remove the block from the frontier:
+    // swap its position in frontier with the last entry in frontier, to keep frontier contiugous
+
+    // f_last = grid index of last element in frontier
+    uint32_t f_last = gstate -> frontier[gstate -> frontier_last];
+    gstate -> frontier[frontier_idx] = f_last;
+    gstate -> frontier_pos[f_last] = frontier_idx;
+    gstate -> frontier_last--;
+
+    // must come after updating f_last, since f_last == grid_idx when it was the last entry
+    gstate -> frontier_pos[grid_idx] = NOT_IN_FRONTIER;
+}
