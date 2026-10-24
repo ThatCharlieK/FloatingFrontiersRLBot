@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "gamepiece_data.h"
 
@@ -32,15 +33,22 @@ Thus the engine needs:
 uint32_t START_GRID_SIZE = GX * GY * GZ;
 uint32_t START_FRONTIER_SIZE = 100000;
 uint32_t MAX_VALID_GP_ROT = 100000; // generous upper bound for total max valid actions
-const uint16_t EMPTY_BLOCK = 1; // convention for empty blocks: bit 0 set, filled blocks always have bit 0 clear
+const uint16_t EMPTY_BLOCK = 0; // convention for empty blocks: all zero, so a calloc'd grid starts empty. filled blocks always have bit 0 set
 
 // face types, as stored in the grid and in Outer_data.face
 #define FACE_CAN_BE_BUILT_ON 0      // 00
 #define FACE_CANT_BE_BUILT_ON 1     // 01
 #define FACE_REQUIRED_TO_BUILD_ON 2 // 10
 
-// frontier_pos value for a cell that isn't in the frontier
-#define NOT_IN_FRONTIER UINT16_MAX
+// frontier_pos value for a cell that isn't in the frontier.
+// 0 so a calloc'd frontier_pos starts with every cell not in the frontier, which means
+// frontier_pos stores (frontier slot + 1)
+#define NOT_IN_FRONTIER 0
+
+// dedup hash set size for get_all_valid_gamepiece_rot (16k slots, ~128KB per GameState).
+// must stay well above (frontier size * n_cubes), or probing slows down (and loops forever if full).
+#define TRIED_BITS 14
+#define TRIED_SIZE (1 << TRIED_BITS)
 
 const uint16_t num_gamepiece = 50; // TODO fill in with true number
 
@@ -48,7 +56,7 @@ typedef struct{
     /*
     grid[x, y, z] is an array of all placed blocks.
     Each element is a uint16_t that represents the different face types of the block at that spot (inclusive):
-    bit 0: empty flag. 1 = empty (EMPTY_BLOCK), 0 = filled
+    bit 0: filled flag. 1 = filled, 0 = empty (the whole cell is EMPTY_BLOCK = 0)
     bytes 1-2: +X face
     bytes 3-4: -X face
     bytes 5-6: +Y face
@@ -72,8 +80,8 @@ typedef struct{
         Contiguous arr of indexes in grid of grid spots that are on the frontier.
         Records all empty indexes in grid that could be built on
     frontier_pos:
-        Same size as grid. frontier_pos[cell_index(pos)] gives the index of *frontier*
-        where that grid would live. For most cells this is NOT_IN_FRONTIER.
+        Same size as grid. frontier_pos[cell_index(pos)] gives (the index of *frontier*
+        where that grid would live) + 1. For most cells this is NOT_IN_FRONTIER (0).
         
     */
     uint32_t* frontier;
@@ -93,22 +101,35 @@ typedef struct{
     // where per_block_delta is precomputed
     uint16_t* gamepiece_data;
 
+    /*
+    Dedup for get_all_valid_gamepiece_rot.
+    The same origin gets reached from several (frontier cell, place block) pairs, so for each
+    gamepiece_rot we track the origins already tried in a small open addressing hash set.
+    Each slot stores the origin itself, so two different origins hashing to the same slot don't collide.
+    A slot only counts as occupied if its stamp == tried_pass, so starting a new gamepiece_rot is
+    just tried_pass++ instead of clearing the whole table.
+    Lives in GameState (not as a global) so each instance has its own and they can run in parallel.
+    */
+    int32_t tried_key[TRIED_SIZE];
+    uint32_t tried_stamp[TRIED_SIZE]; // must start zeroed
+    uint32_t tried_pass; // incremented before each use, so the first pass is 1 and the zeroed stamps read as empty
+
 } GameState;
 
 // game state helpers
 
 GameState* init_GameState(){
     // initilize a game state with the starter list lengths
-    GameState* game_state = (GameState*) Malloc(sizeof(game_state));
+    // calloc zeroes everything, so the dedup table (tried_stamp, tried_pass) starts empty
+    GameState* game_state = (GameState*) calloc(1, sizeof(GameState));
 
     // initilize large starter grid
     // TODO: implement dynamic growing if bounds are exceeded, but 1000 is good enough for now
-    game_state -> grid = Malloc(sizeof(uint16_t) * START_GRID_SIZE);
-    game_state -> frontier_pos = Malloc(sizeof(uint16_t) * START_GRID_SIZE); // same dims as grid
-    for(uint32_t i = 0; i < START_GRID_SIZE; i++){
-        game_state -> grid[i] = EMPTY_BLOCK;
-        game_state -> frontier_pos[i] = NOT_IN_FRONTIER;
-    }
+    // calloc'd memory reads as all zeros, and the OS only gives a page real RAM once it's written to,
+    // so these huge arrays start out as EMPTY_BLOCK / NOT_IN_FRONTIER with no init loop,
+    // and only cost memory around where the city is actually built
+    game_state -> grid = calloc(START_GRID_SIZE, sizeof(uint16_t));
+    game_state -> frontier_pos = calloc(START_GRID_SIZE, sizeof(uint16_t)); // same dims as grid
 
     // initilize 
     game_state -> frontier = Malloc(sizeof(uint16_t) * START_FRONTIER_SIZE);
@@ -181,30 +202,15 @@ valid_action convert_to_valid_action(uint8_t gp_id, uint8_t rot, int32_t gp_base
     return action;
 }
 
-/*
-Dedup for get_all_valid_gamepiece_rot.
-The same origin gets reached from several (frontier cell, place block) pairs, so for each
-gamepiece_rot we track the origins already tried in a small open addressing hash set.
-Each slot stores the origin itself, so two different origins hashing to the same slot don't collide.
-A slot only counts as occupied if its stamp == tried_pass, so starting a new gamepiece_rot is
-just tried_pass++ instead of clearing the whole table.
-TRIED_SIZE must stay well above (frontier size * n_cubes), or probing slows down (and loops forever if full).
-*/
-#define TRIED_BITS 16
-#define TRIED_SIZE (1 << TRIED_BITS)
-static int32_t tried_key[TRIED_SIZE];
-static uint32_t tried_stamp[TRIED_SIZE];
-static uint32_t tried_pass = 0; // incremented before each use, so the first pass is 1 and the zeroed stamps read as empty
-
-uint8_t already_tried(int32_t origin){
+uint8_t already_tried(GameState* gstate, int32_t origin){
     // returns 1 if origin was already tried this pass, otherwise marks it as tried and returns 0
     uint32_t slot = ((uint32_t)origin * 2654435761u) >> (32 - TRIED_BITS); // multiplicative hash
-    while(tried_stamp[slot] == tried_pass){
-        if(tried_key[slot] == origin) return 1;
+    while(gstate->tried_stamp[slot] == gstate->tried_pass){
+        if(gstate->tried_key[slot] == origin) return 1;
         slot = (slot + 1) & (TRIED_SIZE - 1); // linear probe
     }
-    tried_stamp[slot] = tried_pass;
-    tried_key[slot] = origin;
+    gstate->tried_stamp[slot] = gstate->tried_pass;
+    gstate->tried_key[slot] = origin;
     return 0;
 }
 
@@ -222,7 +228,7 @@ valid_action* get_all_valid_gamepiece_rot(GameState* gstate){
     for(uint8_t gp_id = 0; gp_id < num_gamepiece; gp_id++){ // TODO: only gamepieces in hand
         for(uint8_t rot = 0; rot < 4; rot++){
             gamepiece_rot* cur_gp_rot = NULL; // TODO: lookup gamepiece_data[gp_id][rot]
-            tried_pass++; // new pass: forget the origins tried for the previous gamepiece_rot
+            gstate->tried_pass++; // new pass: forget the origins tried for the previous gamepiece_rot
 
             // loop over frontier
             for(int i = 0; i <= gstate->frontier_last; i++){
@@ -237,7 +243,7 @@ valid_action* get_all_valid_gamepiece_rot(GameState* gstate){
                     int32_t cur_gp_rot_pos = frontier_cell - cur_gp_rot->place_blocks[b].delta;
 
                     // skip origins this gamepiece_rot already tried from another frontier cell or place block
-                    if(already_tried(cur_gp_rot_pos)) continue;
+                    if(already_tried(gstate, cur_gp_rot_pos)) continue;
 
                     // check if cur_gp_rot is valid
                     if(is_valid_gp_rot_placement(gstate, cur_gp_rot, cur_gp_rot_pos)){
@@ -288,15 +294,15 @@ void add_to_frontier(GameState* gstate, uint32_t grid_idx){
     // doesn't handle duplicates; caller must ensure grid_idx not in froniter
     gstate -> frontier_last++;
     gstate->frontier[gstate->frontier_last] = grid_idx;
-    gstate->frontier_pos[grid_idx] = gstate->frontier_last;
+    gstate->frontier_pos[grid_idx] = gstate->frontier_last + 1; // +1 since 0 is NOT_IN_FRONTIER
 }
 
 void remove_from_frontier(GameState* gstate, uint32_t grid_idx){
     // if grid_idx was on frontier, remove it from the frontier
     
     // get the index in frontier that the empty block lived in
-    uint16_t frontier_idx = gstate -> frontier_pos[grid_idx];
-    if (frontier_idx == NOT_IN_FRONTIER) return; // cubes can land on cells that were never on the frontier
+    if (gstate -> frontier_pos[grid_idx] == NOT_IN_FRONTIER) return; // cubes can land on cells that were never on the frontier
+    uint16_t frontier_idx = gstate -> frontier_pos[grid_idx] - 1; // frontier_pos stores slot + 1
 
     // remove the block from the frontier:
     // swap its position in frontier with the last entry in frontier, to keep frontier contiugous
@@ -304,7 +310,7 @@ void remove_from_frontier(GameState* gstate, uint32_t grid_idx){
     // f_last = grid index of last element in frontier
     uint32_t f_last = gstate -> frontier[gstate -> frontier_last];
     gstate -> frontier[frontier_idx] = f_last;
-    gstate -> frontier_pos[f_last] = frontier_idx;
+    gstate -> frontier_pos[f_last] = frontier_idx + 1;
     gstate -> frontier_last--;
 
     // must come after updating f_last, since f_last == grid_idx when it was the last entry
