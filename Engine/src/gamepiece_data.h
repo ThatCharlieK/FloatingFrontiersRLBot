@@ -6,12 +6,30 @@
 #define MAX_PLACE_BLOCK_DATA 100 // TODO update to real value
 #define MAX_OUTER_FACE_REQUIREMENT 300 // TODO update to real value
 
+// grid width in x, y and z. lives here so the grid (cell_index) and the precomputed deltas
+// always use the same dims
+#define GX 1000
+#define GY 1000
+#define GZ 1000
+
+// bit 0 of a grid cell: 1 = filled. empty cells are all 0 (EMPTY_BLOCK)
+#define FILLED_BIT 1
+
+static inline int32_t grid_delta(int32_t dx, int32_t dy, int32_t dz){
+    // grid offset for a (dx, dy, dz) offset, since
+    // cell_index(x + dx, y + dy, z + dz) = cell_index(x, y, z) + dx + GX*dy + GX*GY*dz
+    // the precompute should build every delta with this, so they match the grid's dims
+    return dx + GX * dy + GX * GY * dz;
+}
+
 typedef struct{
     // grid offset from gamepiece origin
     // NOT a (x, y, z) interpretable 3d position; Its an offset in the
-    // grid array convention
+    // grid array convention. built with grid_delta
     int32_t delta;
-    uint16_t cell; // value written into grid: bit packed block type and faces
+    // value written into grid: bit packed faces (bits 1-12).
+    // FILLED_BIT is OR'd in when placed, so the precompute doesn't need to set it
+    uint16_t cell;
 } PlaceBlockData;
 
 typedef struct{
@@ -19,6 +37,8 @@ typedef struct{
     // i.e. the cell it touches is not one of the gamepiece's own place_blocks.
     // Non-buildable faces (01) are left out, since they can't affect validity.
     // Required faces that point into the gamepiece are satisfied by its own blocks, so they're left out too.
+    // BUT only if the own block's touching face is buildable (same rule as Unity). The precompute must check
+    // this; a gamepiece_rot with an unsatisfied inward required face can never be placed.
     //
     // Used twice:
     //  - validity: the neighbor at delta must have a buildable opposite face for a connection.
@@ -33,7 +53,7 @@ typedef struct{
     uint8_t n_cubes; // number cubes in a gamepiece_rot
     PlaceBlockData place_blocks[MAX_PLACE_BLOCK_DATA];
 
-    uint8_t n_out; // number of outward buildable faces
+    uint16_t n_out; // number of outward buildable faces. uint16_t since MAX_OUTER_FACE_REQUIREMENT > 255
     // every outward buildable face of the gamepiece_rot. Checked for validity,
     // and used to add new frontier cells after placing
     Outer_data outer[MAX_OUTER_FACE_REQUIREMENT];
