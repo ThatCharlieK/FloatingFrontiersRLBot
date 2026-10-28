@@ -8,7 +8,7 @@
 /*
 Lookup api for the precomputed gamepiece data (data/map1_gamepieces.h).
 The table is shared and read only, so every GameState can use it at the same time.
-gp_id is the index into map 1's GamepieceDatabase.allGamepieces list.
+gp_id is the gamepiece's index in map 1's list of gamepieces.
 */
 
 // number of gamepieces in the map

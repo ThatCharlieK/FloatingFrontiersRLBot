@@ -34,7 +34,7 @@ typedef struct{
     // value written into grid: bit packed faces (bits 1-12).
     // FILLED_BIT is OR'd in when placed, so the precompute doesn't need to set it
     uint16_t cell;
-    // BlockData.BlockType: Farm=0, House=1, Water=2, Ground=3, Windmill=4, Tower=5, Blank=6. for scoring.
+    // block type: Farm=0, House=1, Water=2, Ground=3, Windmill=4, Tower=5, Blank=6. for scoring.
     // fits in the struct's padding, so it costs no memory
     uint8_t block_type;
 } PlaceBlockData;

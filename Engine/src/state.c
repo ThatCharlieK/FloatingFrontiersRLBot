@@ -2,8 +2,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "state.h"
 #include "gamepiece_data.h"
 #include "gamepiece_lookup.h"
+#include "progression.h"
 
 /*
 The main performance object is, from the current gamestate,
@@ -36,80 +38,7 @@ Thus adding a piece to the grid of checking overlaps is just checking:
 where per_block_delta is precomputed
 */
 
-uint32_t START_GRID_SIZE = GX * GY * GZ;
-uint32_t START_FRONTIER_SIZE = UINT16_MAX - 1; // max that fits frontier_pos, which stores slot + 1 in a uint16_t
-uint32_t MAX_VALID_GP_ROT = 100000; // generous upper bound for total max valid actions
-const uint16_t EMPTY_BLOCK = 0; // convention for empty blocks: all zero, so a calloc'd grid starts empty. filled blocks always have bit 0 set
-
-// face types, as stored in the grid and in Outer_data.face
-#define FACE_CAN_BE_BUILT_ON 0      // 00
-#define FACE_CANT_BE_BUILT_ON 1     // 01
-#define FACE_REQUIRED_TO_BUILD_ON 2 // 10
-
-// frontier_pos value for a cell that isn't in the frontier.
-// 0 so a calloc'd frontier_pos starts with every cell not in the frontier, which means
-// frontier_pos stores (frontier slot + 1)
-#define NOT_IN_FRONTIER 0
-
-// dedup hash set size for get_all_valid_gamepiece_rot (16k slots, ~128KB per GameState).
-// must stay well above (frontier size * n_cubes), or probing slows down (and loops forever if full).
-#define TRIED_BITS 14
-#define TRIED_SIZE (1 << TRIED_BITS)
-
-
-typedef struct{
-    /*
-    grid[x, y, z] is an array of all placed blocks.
-    Each element is a uint16_t that represents the different face types of the block at that spot (inclusive):
-    bit 0: filled flag (FILLED_BIT). 1 = filled, 0 = empty (the whole cell is EMPTY_BLOCK = 0)
-    bits 1-2: +X face
-    bits 3-4: -X face
-    bits 5-6: +Y face
-    bits 7-8: -Y face
-    bits 9-10: +Z face
-    bits 11-12: -Z face
-
-    Each face gets 2 bits, because the face is one of the three face types:
-    00: FaceCanBeBuiltOn - for when face has full validity to be used as anything
-    01: FaceCanTouchButCantBeBuiltOn:        for when two faces can touch but can't be used to build on
-    10: RequiredToBuildOn                    for when this face MUST be used to build on (e.g. the bottom of a house).
-
-    The real game also has FaceIsInsideGamepiece, but since I only track the frontier, and never undo, this is unneccessary.
-    FaceCannotTouch is unused by every block in the game, so it's left out too.
-
-    grid is a fixed GX * GY * GZ size, and calloc'd so it only costs memory where the city is built.
-    TODO: grow it if the city ever reaches the edge
-    */
-    uint16_t* grid;
-
-    /*
-    frontier:
-        Contiguous arr of indexes in grid of grid spots that are on the frontier.
-        Records all empty indexes in grid that could be built on
-    frontier_pos:
-        Same size as grid. frontier_pos[cell_index(pos)] gives (the index of *frontier*
-        where that grid would live) + 1. For most cells this is NOT_IN_FRONTIER (0).
-
-    */
-    uint32_t* frontier;
-    uint16_t frontier_len; // number of elements in frontier, which is also the next free slot
-    uint16_t* frontier_pos;
-
-
-    /*
-    Dedup for get_all_valid_gamepiece_rot.
-    The same origin gets reached from several (frontier cell, place block) pairs, so for each
-    gamepiece_rot we track the origins already tried in a small open addressing hash set.
-    Each slot stores the origin itself, so two different origins hashing to the same slot don't collide.
-    A slot only counts as occupied if its stamp == tried_pass, so starting a new gamepiece_rot is
-    just tried_pass++ instead of clearing the whole table.
-    Lives in GameState (not as a global) so each instance has its own and they can run in parallel.
-    */
-    int32_t tried_key[TRIED_SIZE];
-    uint32_t tried_stamp[TRIED_SIZE]; // must start zeroed
-    uint32_t tried_pass; // incremented before each use, so the first pass is 1 and the zeroed stamps read as empty
-
-} GameState;
+// constants and GameState live in state.h
 
 // frontier helpers, defined at the bottom
 void add_to_frontier(GameState* gstate, uint32_t grid_idx);
@@ -117,7 +46,7 @@ void remove_from_frontier(GameState* gstate, uint32_t grid_idx);
 
 // game state helpers
 
-GameState* init_GameState(){
+GameState* init_GameState(uint64_t seed){
     // initilize a game state with the starter list lengths
     // calloc zeroes everything, so the dedup table (tried_stamp, tried_pass) starts empty
     GameState* game_state = (GameState*) calloc(1, sizeof(GameState));
@@ -133,7 +62,19 @@ GameState* init_GameState(){
     game_state -> frontier = malloc(sizeof(uint32_t) * START_FRONTIER_SIZE);
     game_state -> frontier_len = 0;
 
+    // start the game: the initial gamepiece (not played from the hand, so no points) at the grid's center, then the first hand
+    int32_t center = cell_index(GX / 2, GY / 2, GZ / 2);
+    place_gamepiece_rot(game_state, get_gamepiece_rot(get_initial_gamepiece_id(), 0), center);
+    start_progression(game_state, seed);
+
     return game_state;
+}
+
+void free_GameState(GameState* gstate){
+    free(gstate -> grid);
+    free(gstate -> frontier_pos);
+    free(gstate -> frontier);
+    free(gstate);
 }
 
 uint32_t cell_index(uint16_t x_pos3d, uint16_t y_pos3d, uint16_t z_pos3d){
@@ -220,9 +161,15 @@ void get_all_valid_gamepiece_rot(GameState* gstate, valid_action* valid_actions,
 
     uint32_t valid_actions_idx = 0;
 
+    // duplicate cards in hand have the same actions, so only try each gamepiece once
+    uint8_t seen_gp[256] = {0};
+
     // loop order is gamepiece -> rotation -> frontier -> place block, so that within one
     // gamepiece_rot every duplicate is just a repeated origin
-    for(uint8_t gp_id = 0; gp_id < get_num_gamepieces(); gp_id++){ // TODO: only gamepieces in hand
+    for(uint16_t h = 0; h < gstate->hand_len; h++){
+        uint8_t gp_id = gstate->hand[h];
+        if(seen_gp[gp_id]) continue;
+        seen_gp[gp_id] = 1;
         for(uint8_t rot = 0; rot < 4; rot++){
             gamepiece_rot* cur_gp_rot = get_gamepiece_rot(gp_id, rot);
             gstate->tried_pass++; // new pass: forget the origins tried for the previous gamepiece_rot
@@ -275,8 +222,9 @@ void place_gamepiece_rot(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_ba
         // this pbd.delta offset is precomputed
         uint32_t pbd_grid_idx = gp_base_block_idx + pbd.delta; // position in grid of the new block
 
-        // fill it in in the grid. FILLED_BIT marks it as filled, even if all its faces are 00
-        gstate->grid[pbd_grid_idx] = pbd.cell | FILLED_BIT;
+        // fill it in in the grid. FILLED_BIT marks it as filled, even if all its faces are 00.
+        // the block type goes in bits 13-15 for scoring
+        gstate->grid[pbd_grid_idx] = pbd.cell | FILLED_BIT | (pbd.block_type << BLOCK_TYPE_SHIFT);
         remove_from_frontier(gstate, pbd_grid_idx);
     }
 
@@ -289,6 +237,46 @@ void place_gamepiece_rot(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_ba
         if(gstate->frontier_pos[outer_grid_idx] != NOT_IN_FRONTIER) continue;
         add_to_frontier(gstate, outer_grid_idx);
     }
+}
+
+// grid deltas to every cell in a block's 3x3x3 neighborhood, except itself
+static const int32_t NEIGHBOR_26_DELTAS[26] = {
+    GRID_DELTA(-1, -1, -1), GRID_DELTA(0, -1, -1), GRID_DELTA(1, -1, -1),
+    GRID_DELTA(-1, 0, -1), GRID_DELTA(0, 0, -1), GRID_DELTA(1, 0, -1),
+    GRID_DELTA(-1, 1, -1), GRID_DELTA(0, 1, -1), GRID_DELTA(1, 1, -1),
+    GRID_DELTA(-1, -1, 0), GRID_DELTA(0, -1, 0), GRID_DELTA(1, -1, 0),
+    GRID_DELTA(-1, 0, 0), GRID_DELTA(1, 0, 0),
+    GRID_DELTA(-1, 1, 0), GRID_DELTA(0, 1, 0), GRID_DELTA(1, 1, 0),
+    GRID_DELTA(-1, -1, 1), GRID_DELTA(0, -1, 1), GRID_DELTA(1, -1, 1),
+    GRID_DELTA(-1, 0, 1), GRID_DELTA(0, 0, 1), GRID_DELTA(1, 0, 1),
+    GRID_DELTA(-1, 1, 1), GRID_DELTA(0, 1, 1), GRID_DELTA(1, 1, 1),
+};
+
+int32_t score_gamepiece_rot(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_base_block_idx){
+    // each block gets points for every placed block in its 26 neighborhood,
+    // based on the two block types. Blocks of the same gamepiece don't count, which is free here: this runs
+    // before the gamepiece is written into the grid, so its own cells are still empty
+    int32_t points = 0;
+    for(uint16_t i = 0; i < gp_rot->n_cubes; i++){
+        PlaceBlockData pbd = gp_rot->place_blocks[i];
+        int32_t block_idx = gp_base_block_idx + pbd.delta;
+        for(int n = 0; n < 26; n++){
+            uint16_t neighbor = gstate->grid[block_idx + NEIGHBOR_26_DELTAS[n]];
+            if(neighbor == EMPTY_BLOCK) continue;
+            points += get_block_points(pbd.block_type, neighbor >> BLOCK_TYPE_SHIFT);
+        }
+    }
+    return points;
+}
+
+void place_gamepiece(GameState* gstate, uint8_t gp_id, uint8_t rot, int32_t gp_base_block_idx){
+    // play a card from the hand: score, place, then check for level passes
+    gamepiece_rot* gp_rot = get_gamepiece_rot(gp_id, rot);
+    gstate->score += score_gamepiece_rot(gstate, gp_rot, gp_base_block_idx); // must be before placing
+    place_gamepiece_rot(gstate, gp_rot, gp_base_block_idx);
+    remove_from_hand(gstate, gp_id);
+    // pass any levels the new score reached, and deal their hands
+    check_level_passes(gstate);
 }
 
 void add_to_frontier(GameState* gstate, uint32_t grid_idx){

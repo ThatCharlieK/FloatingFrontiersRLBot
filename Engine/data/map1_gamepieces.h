@@ -1,9 +1,9 @@
 // GENERATED FILE, do not edit by hand.
-// Map 1 (Waldsburg) gamepiece ground truth, exported from the Unity project
+// Map 1 (Waldsburg) gamepiece ground truth, exported from Floating Frontiers
 //
 // MAP1_GAMEPIECE_ROTS[gp_id][rot] is the gamepiece_rot for gamepiece gp_id rotated rot * 90 degrees
 // clockwise (from above) around Y. A block's grid index is origin + delta, where the origin is the
-// gamepiece's ProxyPosition in Unity.
+// gamepiece's pivot cell.
 #ifndef FF_MAP1_GAMEPIECES_H
 #define FF_MAP1_GAMEPIECES_H
 
