@@ -8,16 +8,32 @@ class MultiHeadAttentionMLPBlock(nn.Module):
     Does a single pass multi-headed attention, then an MLP
     """
 
-    def __init__(self, block_dim: int, MLP_depth: int = 2, n_heads: int = 4):
+    def __init__(self, block_dim: int, n_heads: int = 4):
         super().__init__()
         self.block_dim = block_dim
         self.n_heads = n_heads
 
-        # n_heads parallel heads of attention, each W_q,k,v is (block_dim -> block_dim/n_heads),
-        # stacked into one big mat
+        """
+        n_heads parallel heads of attention, each with their own W_q,k,v as (block_dim, block_dim/n_heads),
+        ie the head_out is defined to be block_dim/n_heads,
+        stacked into one big mat
+        """
         self.W_q = nn.Linear(block_dim, block_dim)
         self.W_k = nn.Linear(block_dim, block_dim)
         self.W_v = nn.Linear(block_dim, block_dim)
+
+        # output projection
+        self.W_o = nn.Linear(block_dim, block_dim)
+
+        # learned normalization, output = y * normalized + b
+        self.layer_norm_1 = nn.LayerNorm(block_dim)
+        self.layer_norm_2 = nn.LayerNorm(block_dim)
+
+        self.MLP = nn.Sequential(
+            nn.Linear(block_dim, block_dim * 4),
+            nn.ReLU(),
+            nn.Linear(block_dim * 4, block_dim)
+        )
 
     def forward(self, X: torch.Tensor):
         """
@@ -32,25 +48,47 @@ class MultiHeadAttentionMLPBlock(nn.Module):
         V = self.W_v(X)
 
         # reshape into separate heads,
-        # so each Q, K is (n_heads, n, block_dim / n_heads)
-        Q = Q.reshape(self.n_heads, Q.size(0), self.block_dim // self.n_heads)
-        K = K.reshape(self.n_heads, K.size(0), self.block_dim // self.n_heads)
-        V = V.reshape(self.n_heads, V.size(0), self.block_dim // self.n_heads)
+        # so each Q, K, Vis (n_heads, n, block_dim / n_heads)
+        Q = Q.reshape(Q.size(0), self.n_heads, self.block_dim // self.n_heads).transpose(0, 1) # Q = (n_heads, n, head_out)
+        K = K.reshape(K.size(0), self.n_heads, self.block_dim // self.n_heads).transpose(0, 1) # K = (n_heads, n, head_out)
+        V = V.reshape(V.size(0), self.n_heads, self.block_dim // self.n_heads).transpose(0, 1) # V = (n_heads, n, head_out)
 
-        # attention then treats the outer dim as a batch
+        """
+        Transposing K gives (n_heads, head_out, n)
+        Then Q @ K.T(-2, -1) gives (n_heads, n, head_out) @ (n_heads, head_out, n) = (n_heads, n, n)
+        since the outer dimension is treated as the batch.
+
+        So its doing softmax(Q@K.T / sqrt(d_k)) @ V, over n_heads,
+        just using a batch dimension in front
+        """
         S = Q @ K.transpose(-2, -1) / math.sqrt(self.block_dim // self.n_heads)
-        # here A = (n_heads, n, n)
         A = torch.softmax(S, dim=-1)
-        # res = (n_heads, n, block_dim / n_heads)
+        # res = (n_heads, n, n) @ (n_heads, n, head_out) = (n_heads, n, head_out)
         res = A @ V
 
-        # reshape heads back together
-        res = res.reshape(X.size(0), self.n_heads, self.block_dim / self.n_heads)
+        # Concat parallel heads back together
+
+        # tranpose from (n_heads, n, head_out) to (n, n_heads, head_out)
+        res = res.transpose(0, 1)
+        # reshape to (n, block_dim)
         res = res.reshape(X.size(0), self.block_dim)
-        
-        # Concat back together
+
+        """
+        apply output project matrix to mix
+        At this point each row of res is really 
+        [---tokenNfromhead1---- |---tokenNfromhead2---|---tokenNfromhead3----|....]
+        So a simple mat mul can mix info from each head
+        """
+        res = self.W_o(res)
+        # add to residual
+        X = X + res
+        # per-token normalization
+        X = self.layer_norm_1(X)
 
         # MLP on each token
+        X = X + self.MLP(X)
+        X = self.layer_norm_2(X)
+        return X
 
 class Transformer(nn.Module):
 
