@@ -95,16 +95,28 @@ class Transformer(nn.Module):
     def __init__(self, block_dim: int = 128, num_blocks = 10):
         super().__init__()
         self.block_dim = block_dim
-        self.input_layer = nn.Linear(4, block_dim)
+        # each cube on board is [x, y, z, bit1, bit2, bit3...]
+        # where the bits come from the 16 bit bit packed representation, minus the fill bit
+        self.input_layer = nn.Linear(18, block_dim)
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
-        self.score_layer = nn.Linear(4, block_dim) # [id, x, y, z] -> [128]
+        
+        # actions in hand are representated on the gamepiece scale, so thats parameterized by
+        # [id, x, y, z, rot] -> [128]
+        self.score_layer = nn.Linear(5, block_dim)
+        
+        """
+        Classification token:
+        instead of scoring against the last block (which is random dependent on ordering)
+        we score against the same dedicated learned CLS_token at the 0 position
+        """
+        self.CLS_token = nn.Parameter(torch.normal(mean=0, std=0.05, size = (1, block_dim)))
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         Docstring for forward
         
-        :param x: Placed game cubes
-        :type x: Float[Tensor, "n 4"]
+        :param X: Placed game cubes
+        :type X: Float[Tensor, "n 4"]
         :param y: Tensor of valid actions (gamepiece_id, x, y, z)
         :type y: Float[Tensor, "n, 4"]
 
@@ -113,16 +125,17 @@ class Transformer(nn.Module):
         """
 
         # project input to block dims
-        h = self.input_layer(x)
+        h = self.input_layer(X)
+        h = torch.cat((self.CLS_token, h), dim = 0)
 
         # pass through attention-MLP blocks
         for block in self.blocks:
             # TODO inject cross attention from hand into here
             h = block(h)
 
-        # h is now (n, d)
-        # pull our last token
-        q = h[-1]
+        # h is now (n+1, d)
+        # pull out the CLS token and use it to compare
+        q = h[0]
 
         # each row of C is similarity with q action
         C = self.score_layer(y)
