@@ -131,7 +131,8 @@ class SetPointTransformer(nn.Module):
         so its (gamepiece_id, x, y, z, rot)
         :type y_actions: Float[Tensor, "n, 5"]
 
-        :return: (1,) tensor of idx in y of valid action to take
+        :return: (len(y_actions),) tensor of LOG probabilities across all valid actions to take.
+            .exp() gives the probabilities
         :rtype: tensors
         """
 
@@ -151,12 +152,11 @@ class SetPointTransformer(nn.Module):
         # each row of C is similarity with q action
         C = self.score_layer(y_actions)
 
-        # res is vector of probaility distributions over all y actions
-        res = (C @ q).softmax(dim=0)
-
-        # pick random action based on res distribution 
-        # pick random based on similiarty with res
-        idx = torch.multinomial(res, 1)
-        return idx
+        # res is vector of log probabilities over all y actions.
+        # log_softmax instead of log(softmax): a tiny probability can round to 0 in softmax,
+        # and log(0) = -inf -> NaN gradients. log_softmax computes the log directly, so it never hits 0
+        res = (C @ q).log_softmax(dim=0)
+        return res
+    
     
     
