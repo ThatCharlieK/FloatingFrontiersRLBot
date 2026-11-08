@@ -90,19 +90,22 @@ class MultiHeadAttentionMLPBlock(nn.Module):
         X = self.layer_norm_2(X)
         return X
 
-class Transformer(nn.Module):
+class SetPointTransformer(nn.Module):
 
     def __init__(self, block_dim: int = 128, num_blocks = 10):
         super().__init__()
         self.block_dim = block_dim
-        # each cube on board is [x, y, z, bit1, bit2, bit3...]
-        # where the bits come from the 16 bit bit packed representation, minus the fill bit
-        self.input_layer = nn.Linear(18, block_dim)
+        self.placed_input_layer = nn.Linear(18, block_dim) # project up hand -> transformer size
+        self.hand_input_layer = nn.Linear(1, block_dim) # project from ID -> transformer size
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
         
-        # actions in hand are representated on the gamepiece scale, so thats parameterized by
-        # [id, x, y, z, rot] -> [128]
-        self.score_layer = nn.Linear(5, block_dim)
+        self.score_layer = nn.Sequential(
+            nn.Linear(5, block_dim * 4),
+            nn.ReLU(),
+            nn.Linear(block_dim * 4, block_dim * 4),
+            nn.ReLU(),
+            nn.Linear(block_dim * 4, block_dim),
+        )
         
         """
         Classification token:
@@ -111,26 +114,34 @@ class Transformer(nn.Module):
         """
         self.CLS_token = nn.Parameter(torch.normal(mean=0, std=0.05, size = (1, block_dim)))
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, X_placed: torch.Tensor, X_hand: torch.Tensor, y_actions: torch.Tensor) -> torch.Tensor:
         """
         Docstring for forward
         
-        :param X: Placed game cubes
-        :type X: Float[Tensor, "n 4"]
-        :param y: Tensor of valid actions (gamepiece_id, x, y, z)
-        :type y: Float[Tensor, "n, 4"]
+        :param X_placed: Placed game cubes. Each cube on board is [x, y, z, bit1, bit2, bit3...],
+        where the bits come from the 16 bit bit packed representation, minus the fill bit
+        :type X: Float[Tensor, "n 18"]
+
+        :param X_hand: Gamepiece Ids in the hand
+        :type X: Float[Tensor, "n 1"]
+
+
+        :param y_actions: Available actions to the player, enumerated through all placement positions.
+        Each action is parameterized by a gamepiece ID, a rotation, and a world position,
+        so its (gamepiece_id, x, y, z, rot)
+        :type y_actions: Float[Tensor, "n, 5"]
 
         :return: (1,) tensor of idx in y of valid action to take
         :rtype: tensors
         """
 
-        # project input to block dims
-        h = self.input_layer(X)
-        h = torch.cat((self.CLS_token, h), dim = 0)
+        # project placed (n, 18) and (n, 1) to same dimensions
+        h_placed = self.placed_input_layer(X_placed)
+        h_hand = self.hand_input_layer(X_hand)
+        h = torch.cat((self.CLS_token, h_placed, h_hand), dim = 0)
 
         # pass through attention-MLP blocks
         for block in self.blocks:
-            # TODO inject cross attention from hand into here
             h = block(h)
 
         # h is now (n+1, d)
@@ -138,7 +149,7 @@ class Transformer(nn.Module):
         q = h[0]
 
         # each row of C is similarity with q action
-        C = self.score_layer(y)
+        C = self.score_layer(y_actions)
 
         # res is vector of probaility distributions over all y actions
         res = (C @ q).softmax(dim=0)
@@ -147,3 +158,5 @@ class Transformer(nn.Module):
         # pick random based on similiarty with res
         idx = torch.multinomial(res, 1)
         return idx
+    
+    

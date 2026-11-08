@@ -11,19 +11,19 @@ Floating Frontiers RL bot is trained to play [Floating Frontiers](https://store.
 
 
 # Set pointer transformer
-The bot is a set pointer transformer. The game state is represented as two data types:
-1) Cubes on the board are unordered tokens, inputed as `[cube_id, x, y, z]`
-2) Gamepieces in hand are unordered tokens, inputed as `[gamepieceID, x, y, z, rot]`
-The model outputs a single `[GamepieceID, x, y, z, rot]` action
+The bot is a set pointer transformer. The game state is represented as three data types:
+1) `X_placed`: Cubes on the board are unordered tokens, inputed as `[cube_id, x, y, z, rot]`
+2) `X_hand`: Gamepieces in hand are unordered tokens, inputed as `[gamepieceID]`
+3) `Y_actions`: The ~20k enumeration of all possible valid actions is `[GamepieceID, x, y, z, rot]` action. The model outputs a choice of one of these actions
 
 The flow is:
-1) Input the `X: (n, 4)` input to the network
+1) Concatenate `X_placed` and `X_hand` into one `X`, a list of n tokens, some of which are hand tokens and some are cube tokens. 
+2) Concat a special `CLS_token` to the 0th index. This token is always the one scored against.
 2) Run sequential transformers (attn -> MLP)
-3) Cross attention inject a learned embedding of each gamepiece in hand in some layers
 4) Output `H: (n, d)`
-5) Grab last element, `q = H[-1]`
-6) Generate `C` : Pass every valid action (as determined by the environment) in a learned embedding matrix, stack into matrix `C` 
-7) Computer `res = softmax(C * q)`. This does a dot product w/ every action against the model's output `q` , then softmax.
+5) Grab the CLS token, `q = H[0]`
+6) Generate `C` : Pass every valid action (as determined by the environment) in a small MLP, stack into matrix `C` 
+7) Compute `res = softmax(C * q)`. This scores each action against the models predicted action in the CLS token, then softmax to choose the highest match
 8) Sample random action from res distribution
 
 Explanation on quirks:
@@ -32,3 +32,7 @@ Explanation on quirks:
 
 ## Training
 - Parallelize in batches on my m4 max macbook
+
+## Possible future work
+- Turn score_layer into transformer that attends only to place cubes, instead of just a multiplayer MLP
+- Put all action as tokens that can be updated, not just gamepieces in hand, to reduce the logic the model has to learn
