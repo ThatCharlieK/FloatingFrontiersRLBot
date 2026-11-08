@@ -13,6 +13,7 @@
 #define MAX_VALID_GP_ROT 100000 // generous upper bound for total max valid actions
 #define EMPTY_BLOCK 0 // convention for empty blocks: all zero, so a calloc'd grid starts empty. filled blocks always have bit 0 set
 #define MAX_HAND_SIZE 200 // hands are added to on every level pass, so this is far above any real hand
+#define START_PLACED_CAP 4096 // starting capacity of GameState.placed. doubles when full
 
 // face types, as stored in the grid and in Outer_data.face
 #define FACE_CAN_BE_BUILT_ON 0      // 00
@@ -73,6 +74,16 @@ typedef struct GameState{
     uint16_t* frontier_pos;
 
     /*
+    placed:
+        grid index of every placed cube, in placement order (the initial gamepiece included).
+        Lets the observation export walk only the city instead of scanning the whole grid.
+        Grows (doubles) when full, since the city has no size limit
+    */
+    uint32_t* placed;
+    uint32_t placed_len;
+    uint32_t placed_cap;
+
+    /*
     Dedup for get_all_valid_gamepiece_rot.
     The same origin gets reached from several (frontier cell, place block) pairs, so for each
     gamepiece_rot we track the origins already tried in a small open addressing hash set.
@@ -106,6 +117,9 @@ typedef struct GameState{
 
 // new game: empty grid, the map's initial gamepiece placed at the grid's center, and the first hand dealt
 GameState* init_GameState(uint64_t seed);
+// start a new game in an existing GameState. Same result as init_GameState(seed), but only clears the cells
+// the last game touched instead of reallocating the grid
+void reset_GameState(GameState* gstate, uint64_t seed);
 void free_GameState(GameState* gstate);
 
 uint32_t cell_index(uint16_t x_pos3d, uint16_t y_pos3d, uint16_t z_pos3d);

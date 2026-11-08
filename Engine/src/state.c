@@ -62,6 +62,10 @@ GameState* init_GameState(uint64_t seed){
     game_state -> frontier = malloc(sizeof(uint32_t) * START_FRONTIER_SIZE);
     game_state -> frontier_len = 0;
 
+    game_state -> placed = malloc(sizeof(uint32_t) * START_PLACED_CAP);
+    game_state -> placed_len = 0;
+    game_state -> placed_cap = START_PLACED_CAP;
+
     // start the game: the initial gamepiece (not played from the hand, so no points) at the grid's center, then the first hand
     int32_t center = cell_index(GX / 2, GY / 2, GZ / 2);
     place_gamepiece_rot(game_state, get_gamepiece_rot(get_initial_gamepiece_id(), 0), center);
@@ -70,10 +74,26 @@ GameState* init_GameState(uint64_t seed){
     return game_state;
 }
 
+void reset_GameState(GameState* gstate, uint64_t seed){
+    // restart a game in place, without reallocating the huge grid.
+    // Freeing and re-callocing it is very slow: the allocator hands back recycled memory that calloc
+    // then has to zero, all 2GB of it. Instead, only clear the cells this game touched
+    for(uint32_t i = 0; i < gstate->placed_len; i++) gstate->grid[gstate->placed[i]] = EMPTY_BLOCK;
+    for(uint32_t i = 0; i < gstate->frontier_len; i++) gstate->frontier_pos[gstate->frontier[i]] = NOT_IN_FRONTIER;
+    gstate->placed_len = 0;
+    gstate->frontier_len = 0;
+    // tried_stamp doesn't need clearing: tried_pass only ever increases, so old stamps never match
+
+    int32_t center = cell_index(GX / 2, GY / 2, GZ / 2);
+    place_gamepiece_rot(gstate, get_gamepiece_rot(get_initial_gamepiece_id(), 0), center);
+    start_progression(gstate, seed);
+}
+
 void free_GameState(GameState* gstate){
     free(gstate -> grid);
     free(gstate -> frontier_pos);
     free(gstate -> frontier);
+    free(gstate -> placed);
     free(gstate);
 }
 
@@ -226,6 +246,14 @@ void place_gamepiece_rot(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_ba
         // the block type goes in bits 13-15 for scoring
         gstate->grid[pbd_grid_idx] = pbd.cell | FILLED_BIT | (pbd.block_type << BLOCK_TYPE_SHIFT);
         remove_from_frontier(gstate, pbd_grid_idx);
+
+        // record it in the placed list, growing the list if it's full
+        if(gstate->placed_len == gstate->placed_cap){
+            gstate->placed_cap *= 2;
+            gstate->placed = realloc(gstate->placed, sizeof(uint32_t) * gstate->placed_cap);
+        }
+        gstate->placed[gstate->placed_len] = pbd_grid_idx;
+        gstate->placed_len++;
     }
 
     // Loop through all blocks that are on the outside of the current gamepiece
