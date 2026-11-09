@@ -2,6 +2,8 @@ import torch
 from jaxtyping import Float
 import torch.nn as nn
 import math
+from Engine.ffengine import NUM_GAMEPIECES
+
 
 class MultiHeadAttentionMLPBlock(nn.Module):
     """
@@ -96,11 +98,10 @@ class SetPointTransformer(nn.Module):
         super().__init__()
         self.block_dim = block_dim
         self.placed_input_layer = nn.Linear(18, block_dim) # project up hand -> transformer size
-        self.hand_input_layer = nn.Linear(1, block_dim) # project from ID -> transformer size
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
         
         self.score_layer = nn.Sequential(
-            nn.Linear(5, block_dim * 4),
+            nn.Linear(self.block_dim + 4, block_dim * 4),
             nn.ReLU(),
             nn.Linear(block_dim * 4, block_dim * 4),
             nn.ReLU(),
@@ -113,6 +114,11 @@ class SetPointTransformer(nn.Module):
         we score against the same dedicated learned CLS_token at the 0 position
         """
         self.CLS_token = nn.Parameter(torch.normal(mean=0, std=0.05, size = (1, block_dim)))
+
+        # encode a single number id into a high dimensional vector
+        # allowing the model to differentiate between piece 37, and 36, easily, for ex
+        # essentially one hot encoding -> matmul
+        self.gp_id_embedder = nn.Embedding(NUM_GAMEPIECES, block_dim)
 
     def forward(self, X_placed: torch.Tensor, X_hand: torch.Tensor, y_actions: torch.Tensor) -> torch.Tensor:
         """
@@ -138,7 +144,7 @@ class SetPointTransformer(nn.Module):
 
         # project placed (n, 18) and (n, 1) to same dimensions
         h_placed = self.placed_input_layer(X_placed)
-        h_hand = self.hand_input_layer(X_hand)
+        h_hand = self.gp_id_embedder(X_hand[:, 0].long())
         h = torch.cat((self.CLS_token, h_placed, h_hand), dim = 0)
 
         # pass through attention-MLP blocks
@@ -150,13 +156,15 @@ class SetPointTransformer(nn.Module):
         q = h[0]
 
         # each row of C is similarity with q action
-        C = self.score_layer(y_actions)
+        # y_actions is [gp_id, x, y, z, rot], and we embed it to
+        # [gp_id_embedding] + [x, y, z], before then embedding into another MLP
+        # this lets gp_id, a raw number, be more understandable
+        y_gp_id_embedding = self.gp_id_embedder(y_actions[:, 0].long())
+        y_actions_embedding = torch.cat((y_gp_id_embedding, y_actions[:, 1:]), dim = 1)
+        C = self.score_layer(y_actions_embedding)
 
         # res is vector of log probabilities over all y actions.
         # log_softmax instead of log(softmax): a tiny probability can round to 0 in softmax,
         # and log(0) = -inf -> NaN gradients. log_softmax computes the log directly, so it never hits 0
         res = (C @ q).log_softmax(dim=0)
         return res
-    
-    
-    

@@ -141,7 +141,7 @@ def train():
                 entropy = -(log_probs.exp() * log_probs).sum()
 
                 # PPO: how much more (or less) likely this move is now than when it was played.
-                new_prob = result[3]
+                new_prob = log_probs[result[3]] # the model's current log prob of the move it played (result[3] is its index)
                 old_prob = result[4]
                 ratio = torch.exp(new_prob - old_prob) # ratio = new_prob / old_prob, done w/ exponent div
 
