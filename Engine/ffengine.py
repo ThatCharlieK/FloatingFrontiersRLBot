@@ -57,6 +57,8 @@ def _load_lib():
     lib.ff_observe.restype = ctypes.c_int32
     lib.ff_step.argtypes = [ctypes.c_void_p, _ptr(np.int32), _ptr(np.int32), _ptr(np.uint8), _ptr(np.int32)]
     lib.ff_step.restype = ctypes.c_int32
+    lib.ff_load_game.argtypes = [ctypes.c_void_p, ctypes.c_uint32, _ptr(np.int32), ctypes.c_uint32, _ptr(np.int32), ctypes.c_uint32]
+    lib.ff_load_game.restype = ctypes.c_int32
     for name in ("ff_max_actions", "ff_max_hand", "ff_num_gamepieces"):
         getattr(lib, name).argtypes = []
         getattr(lib, name).restype = ctypes.c_uint32
@@ -207,6 +209,28 @@ class FFEngine:
         if _lib.ff_step(self._batch, idx, self._rewards, self._dones, self._final_scores) != 0:
             raise IndexError("an action index is out of range of that game's legal actions")
         return self._rewards.copy(), self._dones.astype(bool), self._final_scores.copy()
+
+    def load_game(self, game: int, pieces, hand) -> int:
+        """
+        Put an exact position into game slot `game`, e.g. to mirror a game being played in Unity.
+        Call observe() afterwards to see it.
+
+        :param game: which slot, 0 to B - 1
+        :param pieces: every piece placed so far, in order, as rows of [gp_id, rot, x, y, z] (raw grid
+            coords). Leave out the map's initial gamepiece: every game already starts with it
+        :param hand: the gp_ids in hand. These replace whatever hand the engine dealt itself
+        :return: the score the engine gives those placements
+
+        :raises ValueError: a piece is out of range, or isn't a legal placement where it is
+        """
+        p = np.ascontiguousarray(pieces, dtype=np.int32).reshape(-1, 5)
+        h = np.ascontiguousarray(hand, dtype=np.int32).reshape(-1)
+        result = _lib.ff_load_game(self._batch, game, p, len(p), h, len(h))
+        errors = {-1: "game slot out of range", -2: "a piece's gp_id, rot or position is out of range",
+                  -3: "a piece isn't a legal placement in the engine (the position doesn't match its rules)"}
+        if result < 0:
+            raise ValueError(errors.get(result, f"load_game error {result}"))
+        return result
 
     def close(self):
         if self._batch:

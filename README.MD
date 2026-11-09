@@ -34,3 +34,6 @@ Explanation on quirks:
 ## Possible future work
 - Turn score_layer into transformer that attends only to place cubes, instead of just a multiplayer MLP
 - Put all action as tokens that can be updated, not just gamepieces in hand, to reduce the logic the model has to learn
+- Brute force tree search approach: 20k action possibilities per move, but actions later in the tree are heavily repeated and so can
+be cached.
+- Give the priviledged model raw probailities from the game actions, let it do a brute force search better

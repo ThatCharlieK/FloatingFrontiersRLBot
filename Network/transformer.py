@@ -105,7 +105,7 @@ class SetPointTransformer(nn.Module):
         self.placed_input_layer = nn.Linear(18, block_dim) # project up hand -> transformer size
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
 
-        self.score_blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim, True) for _ in range(num_score_blocks)])
+        self.score_blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim, cross_attend_q=True) for _ in range(num_score_blocks)])
         self.score_layer = nn.Linear(self.block_dim + 4, block_dim)
         
         """

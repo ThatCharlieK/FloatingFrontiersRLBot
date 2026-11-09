@@ -131,6 +131,36 @@ int32_t ff_step(FFBatch* batch, const int32_t* action_idx,
     return 0;
 }
 
+// in state.c, not in state.h
+uint8_t is_valid_gp_rot_placement(GameState* gstate, gamepiece_rot* gp_rot, int32_t gp_base_idx);
+
+int32_t ff_load_game(FFBatch* batch, uint32_t game,
+                     const int32_t* pieces, uint32_t n_pieces,
+                     const int32_t* hand, uint32_t n_hand){
+    if(game >= batch->n_games) return -1;
+    GameState* gstate = batch->games[game];
+    reset_GameState(gstate, 0); // just the initial gamepiece. the dealt hand is replaced below
+
+    int32_t err = 0;
+    for(uint32_t i = 0; i < n_pieces; i++){
+        const int32_t* p = pieces + (size_t)i * 5;
+        int32_t gp_id = p[0], rot = p[1], x = p[2], y = p[3], z = p[4];
+        if(gp_id < 0 || (uint32_t)gp_id >= get_num_gamepieces() || rot < 0 || rot > 3
+           || x < 0 || x >= GX || y < 0 || y >= GY || z < 0 || z >= GZ){ err = -2; break; }
+        int32_t idx = (int32_t)cell_index((uint16_t)x, (uint16_t)y, (uint16_t)z);
+        gamepiece_rot* gp_rot = get_gamepiece_rot((uint8_t)gp_id, (uint8_t)rot);
+        if(!is_valid_gp_rot_placement(gstate, gp_rot, idx)){ err = -3; break; }
+        place_gamepiece(gstate, (uint8_t)gp_id, (uint8_t)rot, idx);
+    }
+
+    gstate->hand_len = 0;
+    for(uint32_t i = 0; i < n_hand && i < MAX_HAND_SIZE; i++)
+        if(hand[i] >= 0 && (uint32_t)hand[i] < get_num_gamepieces()) add_to_hand(gstate, (uint8_t)hand[i]);
+    gstate->game_over = gstate->hand_len == 0;
+    refresh_legal(batch, game);
+    return err ? err : gstate->score;
+}
+
 uint32_t ff_max_actions(void){ return MAX_VALID_GP_ROT; }
 uint32_t ff_max_hand(void){ return MAX_HAND_SIZE; }
 uint32_t ff_num_gamepieces(void){ return get_num_gamepieces(); }

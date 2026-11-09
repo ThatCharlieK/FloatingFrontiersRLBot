@@ -63,6 +63,22 @@ Returns 0, or -1 (and steps no game) if any index is out of range.
 int32_t ff_step(FFBatch* batch, const int32_t* action_idx,
                 int32_t* rewards, uint8_t* dones, int32_t* final_scores);
 
+/*
+Load an exact position into game slot `game`, for mirroring a game played somewhere else (the Unity viewer).
+    pieces: (n_pieces, 5) int32 rows of [gp_id, rot, x, y, z], in placement order, NOT including the
+            map's initial gamepiece (every game starts with it at the grid center)
+    hand:   (n_hand,) gp_ids, which replace the engine's own hand after the replay
+The pieces are replayed with the normal placement rules and scoring, so the slot's score is what the
+engine would have scored for those moves. Legal actions are re-enumerated, so ff_observe sees the position.
+Returns the replayed score (>= 0), or:
+    -1  game out of range       -2  a gp_id, rot or position is out of range
+    -3  a piece isn't a legal placement where it is (the position differs from the engine's rules)
+On an error the slot holds the pieces replayed so far.
+*/
+int32_t ff_load_game(FFBatch* batch, uint32_t game,
+                     const int32_t* pieces, uint32_t n_pieces,
+                     const int32_t* hand, uint32_t n_hand);
+
 // constants, so Python doesn't hardcode them
 uint32_t ff_max_actions(void);
 uint32_t ff_max_hand(void);

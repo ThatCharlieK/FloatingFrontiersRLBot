@@ -26,6 +26,7 @@ from Engine.ffengine import FFEngine, GRID_CENTER
 import torch.nn as nn
 from typing import Any, Tuple
 import matplotlib.pyplot as plt
+from checkpoint import TrainingTracker
 
 def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tuple[list[list[Any]], float]:
     """
@@ -118,7 +119,9 @@ def train():
     ax.set_ylabel("average final score")
     (score_line,) = ax.plot([], [])
 
-    for _ in range(num_update_steps):
+    tracker = TrainingTracker() # saves best.pt, 10% milestones, log.csv and scores.png under runs/
+
+    for step in range(num_update_steps):
         forward_results, average_score = get_game_choices(model, env, games_played_per_update_step)
         g_t_average = sum(result[6] for result in forward_results) / len(forward_results)
         g_t_std = torch.tensor([r[6] for r in forward_results], dtype = torch.float).std()
@@ -173,6 +176,7 @@ def train():
         ax.relim()
         ax.autoscale_view()
         plt.pause(0.01) # lets the window redraw
+        tracker.update(step, average_score, model)
 
 
 if __name__ == "__main__":
