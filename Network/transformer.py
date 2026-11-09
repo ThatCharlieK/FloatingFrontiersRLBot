@@ -10,11 +10,11 @@ class MultiHeadAttentionMLPBlock(nn.Module):
     Does a single pass multi-headed attention, then an MLP
     """
 
-    def __init__(self, block_dim: int, n_heads: int = 4):
+    def __init__(self, block_dim: int, n_heads: int = 4, cross_attend_q = False):
         super().__init__()
         self.block_dim = block_dim
         self.n_heads = n_heads
-
+        self.cross_attend_q = cross_attend_q
         """
         n_heads parallel heads of attention, each with their own W_q,k,v as (block_dim, block_dim/n_heads),
         ie the head_out is defined to be block_dim/n_heads,
@@ -37,17 +37,22 @@ class MultiHeadAttentionMLPBlock(nn.Module):
             nn.Linear(block_dim * 4, block_dim)
         )
 
-    def forward(self, X: torch.Tensor):
+    def forward(self, X: torch.Tensor, X2: torch.Tensor | None = None):
         """
-        Docstring for forward
+        Pass X through a forward pass of attention to MLP.
+        If cross_attend_q, then Q comes from X, and K,V comes from X2
         
         :param X: (n, block_dim) matrix of each of the n tokens per placed gamecube
         :type X: torch.Tensor
         """
         # Apply each head of attention
         Q = self.W_q(X)
-        K = self.W_k(X)
-        V = self.W_v(X)
+        if self.cross_attend_q:
+            K = self.W_k(X2)
+            V = self.W_v(X2)
+        else:
+            K = self.W_k(X)
+            V = self.W_v(X)
 
         # reshape into separate heads,
         # so each Q, K, Vis (n_heads, n, block_dim / n_heads)
@@ -94,19 +99,14 @@ class MultiHeadAttentionMLPBlock(nn.Module):
 
 class SetPointTransformer(nn.Module):
 
-    def __init__(self, block_dim: int = 128, num_blocks = 10):
+    def __init__(self, block_dim: int = 128, num_blocks = 10, num_score_blocks = 2):
         super().__init__()
         self.block_dim = block_dim
         self.placed_input_layer = nn.Linear(18, block_dim) # project up hand -> transformer size
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
-        
-        self.score_layer = nn.Sequential(
-            nn.Linear(self.block_dim + 4, block_dim * 4),
-            nn.ReLU(),
-            nn.Linear(block_dim * 4, block_dim * 4),
-            nn.ReLU(),
-            nn.Linear(block_dim * 4, block_dim),
-        )
+
+        self.score_blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim, True) for _ in range(num_score_blocks)])
+        self.score_layer = nn.Linear(self.block_dim + 4, block_dim)
         
         """
         Classification token:
@@ -155,16 +155,23 @@ class SetPointTransformer(nn.Module):
         # pull out the CLS token and use it to compare
         q = h[0]
 
-        # each row of C is similarity with q action
+
         # y_actions is [gp_id, x, y, z, rot], and we embed it to
         # [gp_id_embedding] + [x, y, z], before then embedding into another MLP
         # this lets gp_id, a raw number, be more understandable
         y_gp_id_embedding = self.gp_id_embedder(y_actions[:, 0].long())
-        y_actions_embedding = torch.cat((y_gp_id_embedding, y_actions[:, 1:]), dim = 1)
-        C = self.score_layer(y_actions_embedding)
+        y_embedded = torch.cat((y_gp_id_embedding, y_actions[:, 1:]), dim = 1)
+        y_h = self.score_layer(y_embedded)
+        
+        # run y_embedded through a transformer, Q's coming from actions, KV coming from h
+        # this allows the model to learn more when creating its action embedding
+        # full self attention here is too expensive since theres 20k+ actions
+
+        for score_block in self.score_blocks:
+            y_h = score_block(y_h, h)
 
         # res is vector of log probabilities over all y actions.
         # log_softmax instead of log(softmax): a tiny probability can round to 0 in softmax,
         # and log(0) = -inf -> NaN gradients. log_softmax computes the log directly, so it never hits 0
-        res = (C @ q).log_softmax(dim=0)
+        res = (y_h @ q).log_softmax(dim=0)
         return res

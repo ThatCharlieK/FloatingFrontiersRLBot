@@ -2,12 +2,10 @@
 Floating Frontiers RL bot is trained to play [Floating Frontiers](https://store.steampowered.com/app/4034080/Floating_Frontiers/), A city building strategy game I developed.
 - Trained in a fast C RL enviornment 1:1 replica of the real game logic
 - Set point transformer achitecture, generates score all valid actions and picks highest one
-- [TODO]M parameter network trained locally on M4 Macbook pro
+- 7M parameter network trained locally on M4 Macbook pro
 
 # The RL enviornment
 `/Engine` is a fast replica of floating frontiers logic, written in C. The real game has four maps, but for now the bot only plays the first map, which has simpler rules.
-
-
 
 
 # Set pointer transformer
