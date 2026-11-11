@@ -54,6 +54,10 @@ def compute_cost(n_placed: int, n_hand: int, m: int, model: transformer.SetPoint
     n = n_placed + n_hand + 1
     return n * (12 * L + 2 * S) + m * (10 * S + 1) + (2 * L * n * n + 2 * S * n * m) / d
 
+# the value head predicts g_t / VALUE_SCALE: targets around 1, not in the hundreds, so its
+# output layer can reach them at small learning rates and its loss doesn't swamp the policy loss
+VALUE_SCALE = 100
+
 SHAPE_BIN_RATIO = 1.4 # measured: 1.3-1.4 minimizes epoch time (smaller = less padding, but more, smaller buckets)
 
 def shape_bin(record) -> Tuple[int, int]:
@@ -69,8 +73,8 @@ def shape_bin(record) -> Tuple[int, int]:
 def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tuple[list[list[Any]], float]:
     """
     With no gradients, play through n_target_games games and collect, per each action,
-    a [placed, hand, actions, action_idx, old_log_prob, compute_required, reward, g_t],
-    (ndarray, ndarray, ndarray, int, float, float, int, int)
+    a [placed, hand, actions, action_idx, old_log_prob, compute_required, pred_g_t, reward, g_t],
+    (ndarray, ndarray, ndarray, int, float, float, float, int, int)
     representing the model's forward pass
     parameters and its g_t:
         placed: The placed cubes at the current step
@@ -83,6 +87,7 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
         g_t: The return to go scoring metric; Higher means the current action
             resulted in a better overall score
         compute_required: compute_cost() estimate of this record's fwd+bwd cost
+        pred_g_t: the value head's prediction of g_t when this move was played, in points
     
     """
 
@@ -109,9 +114,10 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
             placed_b[..., 0:3] -= GRID_CENTER   # placed: [x, y, z, bits...]
             actions_b[..., 1:4] -= GRID_CENTER  # actions: [gp_id, x, y, z, rot]
 
-            log_probs = model.forward(torch.from_numpy(placed_b).to(device), lengths_to_mask(obs.n_placed, P, device),
+            log_probs, preds = model.forward(torch.from_numpy(placed_b).to(device), lengths_to_mask(obs.n_placed, P, device),
                                       torch.from_numpy(hand_b).to(device), lengths_to_mask(obs.n_hand, H, device),
-                                      torch.from_numpy(actions_b).to(device), lengths_to_mask(obs.n_actions, M, device)).cpu() # (n_games, M)
+                                      torch.from_numpy(actions_b).to(device), lengths_to_mask(obs.n_actions, M, device)) # (n_games, M), (n_games,)
+            log_probs, preds = log_probs.cpu(), preds.cpu()
             # .cpu(): one copy back per step, so sampling and the per-game .item() calls don't each wait on the GPU
             indicies = torch.multinomial(log_probs.exp(), 1).squeeze(1).tolist() # one sampled action per game
 
@@ -128,7 +134,7 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
                 # estimate of the compute required for this action, used to sort records into buckets
                 compute_required = compute_cost(len(placed), len(hand), len(actions), model)
                 
-                in_progress[i].append([placed, hand, actions, action_idx, old_log_prob, compute_required])
+                in_progress[i].append([placed, hand, actions, action_idx, old_log_prob, compute_required, preds[i].item() * VALUE_SCALE])
 
             # For each game remaining, compute the rewards
             rewards, dones, final_scores = env.step(indicies)
@@ -141,8 +147,8 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
                     # return to go: walk the game backwards, keeping a running sum of rewards
                     g = 0
                     for record in reversed(in_progress[i]):
-                        g += record[6]          # record = [placed, hand, actions, action_idx, old_log_prob, compute_required, reward]
-                        record.append(g)        # now [placed, hand, actions, action_idx, old_log_prob, compute_required, reward, g_t]
+                        g += record[7]          # record = [placed, hand, actions, action_idx, old_log_prob, compute_required, pred_g_t, reward]
+                        record.append(g)        # now [placed, hand, actions, action_idx, old_log_prob, compute_required, pred_g_t, reward, g_t]
                     finished.extend(in_progress[i])
                     n_finished_games += 1
                     in_progress[i] = []         # a new game already started in this slot
@@ -164,6 +170,7 @@ def train():
     B = 0.01
     n_epochs = 4      # PPO: update passes over each batch of games, instead of 1
     clip_eps = 0.2    # PPO: each move's probability may move at most ~20% per batch
+    value_coef = 0.5  # weight of the value head's loss against the policy loss
 
     # max compute_cost() of one padded bucket. memory on mps is ~1.3-2.1 GB per 1M units
     scaled_compute_budget = 1000000 # measured: the gpu saturates at ~0.5-1M per bucket, bigger only adds padding (~5 GB peak)
@@ -181,8 +188,10 @@ def train():
 
     for step in range(num_update_steps):
         forward_results, average_score = get_game_choices(model, env, games_played_per_update_step)
-        g_t_average = sum(result[7] for result in forward_results) / len(forward_results)
-        g_t_std = torch.tensor([r[7] for r in forward_results], dtype = torch.float).std()
+        # advantage of each move: g_t - pred_g_t. Normalized over the whole batch, so the policy loss
+        # stays around +-1 whatever the score scale
+        advantages = torch.tensor([r[8] - r[6] for r in forward_results], dtype = torch.float)
+        adv_mean, adv_std = advantages.mean().item(), advantages.std().item()
 
         # maximize compute by sorting forward_results into buckets with similar size tokens, so that
         # padding is similar size and there aren't early game (10+ tok) and late games (10k+ tok)
@@ -227,12 +236,16 @@ def train():
                 placed, placed_mask = pad_batch([r[0] for r in bucket], device)
                 hand, hand_mask = pad_batch([r[1] for r in bucket], device)
                 actions, actions_mask = pad_batch([r[2] for r in bucket], device)
-                log_probs = model.forward(placed, placed_mask, hand, hand_mask, actions, actions_mask) # (b, M)
+                log_probs, cur_pred = model.forward(placed, placed_mask, hand, hand_mask, actions, actions_mask) # (b, M)
 
-                # subtract by the average gt so instead of all moves being increased,
-                # we increase moves that are better than average, and decrease less than average
-                # also normalize so good early g_t scores have the same relatively good scores later on
-                g_t_normalized = (torch.tensor([r[7] for r in bucket], dtype=torch.float, device=device) - g_t_average) / (g_t_std + 1e-8)
+
+                # g_t := difference from current action to end game score.
+                # One way to train is (g_t - end score), but that puts early actions at >100
+                # and late actions at <10. Thats not a good signal for the model
+                # instead we train with (g_t - pred_g_t), where the model also learns to predict the
+                # predicted g_t at this point. If (g_t - pred_g_t) is high, that means the
+                # move was a better move than normal
+                g_t_diff = (torch.tensor([r[8] - r[6] for r in bucket], dtype=torch.float, device=device) - adv_mean) / (adv_std + 1e-8)
 
                 # entropy loss: incenitivze not being too confident around one decision
                 # padded actions have log prob -inf; zero them so 0 * -inf doesn't give nan
@@ -254,13 +267,18 @@ def train():
 
                 Once the ratio of new vs old probability is more than 20%, we cap it to 20,
                 so that the policy loss reflects at most a soft capped 20% increase in
-                probabilities. Once the ratio passes the limit in the direction g_t_normalized
+                probabilities. Once the ratio passes the limit in the direction g_t_diff
                 pushes it, min() picks the clipped term, which is a constant, so it zeros
                 the gradient and stops this move from being optimized further
                 """
-                policy_loss = -torch.min(ratio * g_t_normalized, clipped_ratio * g_t_normalized)
+                policy_loss = -torch.min(ratio * g_t_diff, clipped_ratio * g_t_diff)
 
-                cur_loss = policy_loss - B * entropy
+                # pred learns to match the g_t's in bucket (in units of VALUE_SCALE points)
+                pred_loss = torch.square(cur_pred - torch.tensor([r[8] for r in bucket], dtype=torch.float, device=device) / VALUE_SCALE)
+                
+                cur_loss = policy_loss - B * entropy + value_coef * pred_loss
+
+
                 (cur_loss.sum() / len(forward_results)).backward() # compute averaged gradients
 
             # step based on average gradients

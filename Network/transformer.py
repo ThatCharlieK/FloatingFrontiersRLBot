@@ -131,6 +131,18 @@ class SetPointTransformer(nn.Module):
         """
         self.CLS_token = nn.Parameter(torch.normal(mean=0, std=0.05, size = (1, 1, block_dim)))
 
+        """
+        Value head to improve learning signal
+        Learns to predict, from this state (by parsing a pooled vector of all tokens)
+        how many more points to expect until the game ends
+        """
+        self.value_head = nn.Sequential(
+                    nn.Linear(block_dim * 2, block_dim),
+                    nn.ReLU(),
+                    nn.Linear(block_dim, 1)
+                )
+
+
         # encode a single number id into a high dimensional vector
         # allowing the model to differentiate between piece 37, and 36, easily, for ex
         # essentially one hot encoding -> matmul
@@ -138,7 +150,7 @@ class SetPointTransformer(nn.Module):
 
     def forward(self, X_placed: torch.Tensor, X_placed_mask: torch.Tensor,
                 X_hand: torch.Tensor, X_hand_mask: torch.Tensor,
-                y_actions: torch.Tensor, y_actions_mask: torch.Tensor) -> torch.Tensor:
+                y_actions: torch.Tensor, y_actions_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         
         :param X_placed: Placed game cubes. Each cube on board is [x, y, z, bit1, bit2, bit3...],
@@ -163,8 +175,9 @@ class SetPointTransformer(nn.Module):
                         we must pad to -inf so that we don't use the junk values.
                 
         
-        :return: (b, m) tensor of LOG probabilities across all valid actions to take.
-            .exp() gives the probabilities
+        :return: Two tensors:
+        (b, m) tensor of LOG probabilities across all valid actions to take. .exp() gives the probabilities
+        (b,) tensor of predicted remaining scores at each game (in units of train.VALUE_SCALE points), predicted by the value head
         :rtype: tensors
         """
 
@@ -187,7 +200,6 @@ class SetPointTransformer(nn.Module):
         # pull out the CLS token and use it to compare
         q = h[:, 0] # (b, d)
 
-
         # y_actions is [gp_id, x, y, z, rot], and we embed it to
         # [gp_id_embedding] + [x, y, z, rot], before then embedding into another MLP
         # this lets gp_id, a raw number, be more understandable
@@ -200,7 +212,16 @@ class SetPointTransformer(nn.Module):
         # full self attention here is too expensive since theres 20k+ actions
 
         for score_block in self.score_blocks:
-            y_h = score_block(y_h, h, X_mask=h_mask)
+            y_h = score_block(y_h, h, X_mask=h_mask)        
+
+        # run the value head; It needs to predict the remaining score,
+        # so it needs all information that includes both cubes, hands, and actions,
+        # so run it on a pooled y_h
+        masked_y_h = y_h.masked_fill(~y_actions_mask[:, :, None], 0) # zero out garbage values
+        # average across the real tokens only, going (b, m, d) -> (b, d)
+        averaged = masked_y_h.sum(dim = 1) / y_actions_mask.sum(dim = 1, keepdim = True)
+        pooled = torch.cat((q, averaged), dim = -1)
+        preds = self.value_head(pooled).squeeze(-1) # (b, 1) -> (b,)
 
         # squeezes so (b, m, d) @ (b, d) becomes (b, m, d) @ (b, d, 1)
         logits = (y_h @ q.unsqueeze(2)).squeeze(2) # logits = (b, m)
@@ -212,4 +233,4 @@ class SetPointTransformer(nn.Module):
         # log_softmax instead of log(softmax): a tiny probability can round to 0 in softmax,
         # and log(0) = -inf -> NaN gradients. log_softmax computes the log directly, so it never hits 0
         res = logits.log_softmax(dim=-1)
-        return res
+        return (res, preds)
