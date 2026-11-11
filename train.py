@@ -21,6 +21,7 @@ Simplified training flow:
     to 1, this over time results in incenitivizing moves that result in long term scoring
 """
 from Network import transformer
+import math
 import torch
 from Engine.ffengine import FFEngine, GRID_CENTER
 import torch.nn as nn
@@ -28,22 +29,48 @@ from typing import Any, Tuple
 import matplotlib.pyplot as plt
 from checkpoint import TrainingTracker
 
-def lengths_to_mask(lengths, max_len: int) -> torch.Tensor:
-    """(B,) per-game row counts -> (B, max_len) bool mask, True for each game's first lengths[i] rows"""
-    return torch.arange(max_len)[None, :] < torch.from_numpy(lengths.astype("int64"))[:, None]
+def lengths_to_mask(lengths, max_len: int, device: torch.device) -> torch.Tensor:
+    """(B,) per-game row counts -> (B, max_len) bool mask on device, True for each game's first lengths[i] rows"""
+    return (torch.arange(max_len)[None, :] < torch.from_numpy(lengths.astype("int64"))[:, None]).to(device)
 
-def pad_batch(arrays: list) -> Tuple[torch.Tensor, torch.Tensor]:
-    """list of (n_i, F) arrays -> zero-padded (B, max n_i, F) tensor and its (B, max n_i) bool mask"""
+def pad_batch(arrays: list, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """list of (n_i, F) arrays -> zero-padded (B, max n_i, F) tensor and its (B, max n_i) bool mask, both on device"""
     padded = nn.utils.rnn.pad_sequence([torch.from_numpy(a) for a in arrays], batch_first=True)
     lengths = torch.tensor([len(a) for a in arrays])
-    return padded, torch.arange(padded.size(1))[None, :] < lengths[:, None]
+    return padded.to(device), (torch.arange(padded.size(1))[None, :] < lengths[:, None]).to(device)
+
+def compute_cost(n_placed: int, n_hand: int, m: int, model: transformer.SetPointTransformer) -> float:
+    """
+    Estimated fwd+bwd cost of one record padded to n_placed, n_hand, m, in units of block_dim^2 multiply-adds.
+    At these sizes the per-token linear layers dominate, not attention:
+        each of the n = CLS + placed + hand tokens: 12 d^2 per self-attention block (W_q,k,v,o = 4 d^2, MLP = 8 d^2),
+            plus 2 d^2 per score block (its W_k, W_v)
+        each of the m actions: 10 d^2 per score block (W_q, W_o, MLP), plus d^2 for score_layer
+        attention: 2 n^2 d per self-attention block and 2 n m d per score block (Q @ K.T and A @ V)
+    Measured on mps, time and memory per unit stay within ~1.5x across n = 8..200, m = 16..5000
+    (n^2 + n m was off by ~30x)
+    """
+    d, L, S = model.block_dim, len(model.blocks), len(model.score_blocks)
+    n = n_placed + n_hand + 1
+    return n * (12 * L + 2 * S) + m * (10 * S + 1) + (2 * L * n * n + 2 * S * n * m) / d
+
+SHAPE_BIN_RATIO = 1.4 # measured: 1.3-1.4 minimizes epoch time (smaller = less padding, but more, smaller buckets)
+
+def shape_bin(record) -> Tuple[int, int]:
+    """
+    (actions, placed) bin of a record on a log scale, each bin spanning a factor of SHAPE_BIN_RATIO.
+    Placed and action counts are only loosely correlated (r ~ 0.5), so sorting by one number leaves 40-70%
+    padding in a bucket; keeping each bucket inside one bin cuts it to ~15%
+    """
+    return (int(math.log(max(1, len(record[2]))) / math.log(SHAPE_BIN_RATIO)),
+            int(math.log(max(1, len(record[0]))) / math.log(SHAPE_BIN_RATIO)))
 
 
 def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tuple[list[list[Any]], float]:
     """
     With no gradients, play through n_target_games games and collect, per each action,
     a [placed, hand, actions, action_idx, old_log_prob, compute_required, reward, g_t],
-    (ndarray, ndarray, ndarray, int, float, int, int, int)
+    (ndarray, ndarray, ndarray, int, float, float, int, int)
     representing the model's forward pass
     parameters and its g_t:
         placed: The placed cubes at the current step
@@ -55,7 +82,7 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
         reward: The points this one action earned
         g_t: The return to go scoring metric; Higher means the current action
             resulted in a better overall score
-        compute_required: int estimate n^2 + m * n of this record's attention cost (n = CLS + placed + hand, m = actions)
+        compute_required: compute_cost() estimate of this record's fwd+bwd cost
     
     """
 
@@ -66,6 +93,7 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
     in_progress = [[] for _ in range(env.n_games)] # one list per env slot
     finished = [] # records of every move from completed games
     n_finished_games = 0 # finished holds moves, not games, so count games separately
+    device = next(model.parameters()).device
     with torch.no_grad():
         while n_finished_games < n_target_games:
             obs = env.observe()
@@ -81,9 +109,10 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
             placed_b[..., 0:3] -= GRID_CENTER   # placed: [x, y, z, bits...]
             actions_b[..., 1:4] -= GRID_CENTER  # actions: [gp_id, x, y, z, rot]
 
-            log_probs = model.forward(torch.from_numpy(placed_b), lengths_to_mask(obs.n_placed, P),
-                                      torch.from_numpy(hand_b), lengths_to_mask(obs.n_hand, H),
-                                      torch.from_numpy(actions_b), lengths_to_mask(obs.n_actions, M)) # (n_games, M)
+            log_probs = model.forward(torch.from_numpy(placed_b).to(device), lengths_to_mask(obs.n_placed, P, device),
+                                      torch.from_numpy(hand_b).to(device), lengths_to_mask(obs.n_hand, H, device),
+                                      torch.from_numpy(actions_b).to(device), lengths_to_mask(obs.n_actions, M, device)).cpu() # (n_games, M)
+            # .cpu(): one copy back per step, so sampling and the per-game .item() calls don't each wait on the GPU
             indicies = torch.multinomial(log_probs.exp(), 1).squeeze(1).tolist() # one sampled action per game
 
             # collect actions for each game
@@ -96,10 +125,8 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
                 # PPO: remember how likely the model thought this move was when it played it
                 old_log_prob = log_probs[i, action_idx].item()
 
-                # estimate of the compute required for this action:
-                # where compute = b * (n^2 + m * n) for b batches, n tokens, m actions
-                n_tok = len(placed) + len(hand) + 1 # number of non-action tokens, +1 for CLS
-                compute_required = n_tok ** 2 + n_tok * len(actions)
+                # estimate of the compute required for this action, used to sort records into buckets
+                compute_required = compute_cost(len(placed), len(hand), len(actions), model)
                 
                 in_progress[i].append([placed, hand, actions, action_idx, old_log_prob, compute_required])
 
@@ -124,22 +151,22 @@ def get_game_choices(model: nn.Module, env: FFEngine, n_target_games: int) -> Tu
 
 def train():
     torch.set_num_threads(1) # measured for empirical speedup
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu") # mps: Apple GPU, ~4-5x faster here
     
     # init model & env
     model = transformer.SetPointTransformer(256, 7) # smallish network for now
+    model.to(device) # before creating the optimizer, so its state lives on the same device
     n_games = 16
     env = FFEngine(n_games, seed = 0)
     num_update_steps = 10000
-    games_played_per_update_step = 30
+    games_played_per_update_step = 60
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     B = 0.01
     n_epochs = 4      # PPO: update passes over each batch of games, instead of 1
     clip_eps = 0.2    # PPO: each move's probability may move at most ~20% per batch
 
-    # rough budget for number of tokens this machine can handle in a single batch
-    # instead of computing raw tokens we max it as a scaled_compute_budget, since compute roughly
-    # scales with n_tokens^2 in attention
-    scaled_compute_budget = 3000000
+    # max compute_cost() of one padded bucket. memory on mps is ~1.3-2.1 GB per 1M units
+    scaled_compute_budget = 1000000 # measured: the gpu saturates at ~0.5-1M per bucket, bigger only adds padding (~5 GB peak)
 
     # live plot of the average final game score per update step. ion() = interactive mode, so the
     # window redraws during training instead of blocking until the end
@@ -161,8 +188,8 @@ def train():
         # padding is similar size and there aren't early game (10+ tok) and late games (10k+ tok)
         # mixed together, since that would waste most compute on padding
 
-        # sort by compute required
-        forward_results.sort(key = lambda res: res[5])
+        # sort by shape bin, then compute required
+        forward_results.sort(key = lambda res: (shape_bin(res), res[5]))
 
         # maximize compute by sorting into buckets where each bucket is the max
         # that can be batched at once
@@ -172,14 +199,19 @@ def train():
         # We batch over buckets so that each bucket has the max number of tokens it can handle
         buckets = [[]]
         bucket_i = 0
+        P = H = M = 0 # the current bucket's padded sizes
         for res in forward_results:
-            # because of padding, the compute for each element per bucket is the same,
-            # since everything in a given bucket is padded to the same length
-            # thus since forward_results is sorted, the compute for a bucket is the 
-            # compute for highest res * num elements in that bucket
-            if (len(buckets[bucket_i]) + 1) * res[5] > scaled_compute_budget:
+            # because of padding, every element in a bucket costs the same: pad_batch pads placed, hand
+            # and actions each to their own max over the bucket, so a bucket costs
+            # len(bucket) * compute_cost(max placed, max hand, max actions)
+            p, h, m = max(P, len(res[0])), max(H, len(res[1])), max(M, len(res[2]))
+            # start a new bucket at each new shape bin, or when the padded bucket would go over budget
+            if buckets[bucket_i] and (shape_bin(res) != shape_bin(buckets[bucket_i][-1])
+                                      or (len(buckets[bucket_i]) + 1) * compute_cost(p, h, m, model) > scaled_compute_budget):
                 bucket_i += 1
                 buckets.append([])
+                p, h, m = len(res[0]), len(res[1]), len(res[2])
+            P, H, M = p, h, m
             buckets[bucket_i].append(res)
 
 
@@ -192,15 +224,15 @@ def train():
             for bucket in buckets:
                 if not bucket:
                     continue # edge case: a single record over budget leaves the first bucket empty
-                placed, placed_mask = pad_batch([r[0] for r in bucket])
-                hand, hand_mask = pad_batch([r[1] for r in bucket])
-                actions, actions_mask = pad_batch([r[2] for r in bucket])
+                placed, placed_mask = pad_batch([r[0] for r in bucket], device)
+                hand, hand_mask = pad_batch([r[1] for r in bucket], device)
+                actions, actions_mask = pad_batch([r[2] for r in bucket], device)
                 log_probs = model.forward(placed, placed_mask, hand, hand_mask, actions, actions_mask) # (b, M)
 
                 # subtract by the average gt so instead of all moves being increased,
                 # we increase moves that are better than average, and decrease less than average
                 # also normalize so good early g_t scores have the same relatively good scores later on
-                g_t_normalized = (torch.tensor([r[7] for r in bucket], dtype=torch.float) - g_t_average) / (g_t_std + 1e-8)
+                g_t_normalized = (torch.tensor([r[7] for r in bucket], dtype=torch.float, device=device) - g_t_average) / (g_t_std + 1e-8)
 
                 # entropy loss: incenitivze not being too confident around one decision
                 # padded actions have log prob -inf; zero them so 0 * -inf doesn't give nan
@@ -208,8 +240,8 @@ def train():
 
                 # PPO: how much more (or less) likely this move is now than when it was played.
                 # the model's current log prob of the move it played in each row (r[3] is its index)
-                new_prob = log_probs[torch.arange(len(bucket)), torch.tensor([r[3] for r in bucket])]
-                old_prob = torch.tensor([r[4] for r in bucket])
+                new_prob = log_probs[torch.arange(len(bucket), device=device), torch.tensor([r[3] for r in bucket], device=device)]
+                old_prob = torch.tensor([r[4] for r in bucket], device=device)
                 ratio = torch.exp(new_prob - old_prob) # ratio = new_prob / old_prob, done w/ exponent div
 
                 # the same ratio, but kept between 0.8 and 1.2
@@ -233,6 +265,9 @@ def train():
 
             # step based on average gradients
             optimizer.step()
+
+        # mps keeps freed buffers cached in host-shared memory; without this the process grows ~1.5 GB per update
+        if device.type == "mps": torch.mps.empty_cache()
 
         # update the plot
         score_history.append(average_score)
