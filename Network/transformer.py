@@ -122,7 +122,7 @@ class SetPointTransformer(nn.Module):
         self.blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim) for _ in range(num_blocks)])
 
         self.score_blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim, cross_attend_q=True) for _ in range(num_score_blocks)])
-        self.score_layer = nn.Linear(self.block_dim + 4, block_dim)
+        self.score_layer = nn.Linear(self.block_dim + 5, block_dim) # gp_id embedding + [x, y, z, rot, points]
         
         """
         Classification token:
@@ -148,9 +148,20 @@ class SetPointTransformer(nn.Module):
         # essentially one hot encoding -> matmul
         self.gp_id_embedder = nn.Embedding(NUM_GAMEPIECES, block_dim)
 
+        # global features (ie score) are injected into a special global_features_token,
+        # in the second slot next to the cls token. This way the model can learn with
+        # global game state information during atttention
+        self.global_features_layer = nn.Sequential(
+                    nn.Linear(3, block_dim),
+                    nn.ReLU(),
+                    nn.Linear(block_dim, block_dim)
+                )
+
     def forward(self, X_placed: torch.Tensor, X_placed_mask: torch.Tensor,
                 X_hand: torch.Tensor, X_hand_mask: torch.Tensor,
-                y_actions: torch.Tensor, y_actions_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                y_actions: torch.Tensor, y_actions_mask: torch.Tensor,
+                global_features: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         
         :param X_placed: Placed game cubes. Each cube on board is [x, y, z, bit1, bit2, bit3...],
@@ -168,12 +179,16 @@ class SetPointTransformer(nn.Module):
 
         :param y_actions: Available actions to the player, enumerated through all placement positions.
         Each action is parameterized by a gamepiece ID, a rotation, and a world position,
-        so its (gamepiece_id, x, y, z, rot)
-        :type y_actions: Float[Tensor, "b, n, 5"]
+        plus the points playing it would score right now (pre-scaled, see train.py),
+        so its (gamepiece_id, x, y, z, rot, points)
+        :type y_actions: Float[Tensor, "b, n, 6"]
 
         :param y_actions_mask: Each batch has a different number of actions,
                         we must pad to -inf so that we don't use the junk values.
-                
+
+        :param global_features: Global features about the game, projected into a single token.
+        (b, 3), each row is [score, points until next level, level index], pre-scaled to small numbers (see train.py)
+                        
         
         :return: Two tensors:
         (b, m) tensor of LOG probabilities across all valid actions to take. .exp() gives the probabilities
@@ -187,21 +202,22 @@ class SetPointTransformer(nn.Module):
         h_placed = self.placed_input_layer(X_placed)
         h_hand = self.gp_id_embedder(X_hand[..., 0].long())
         cls = self.CLS_token.expand(n_batch, -1, -1) # copy cls along batch dim
-        h = torch.cat((cls, h_placed, h_hand), dim = 1)
+        global_feat = self.global_features_layer(global_features).unsqueeze(1) # (b, 3) -> (b, 1, d)
+        h = torch.cat((cls, global_feat, h_placed, h_hand), dim = 1)
 
-        cls_mask = torch.ones(n_batch, 1, dtype=torch.bool, device=X_placed_mask.device)
+        cls_mask = torch.ones(n_batch, 2, dtype=torch.bool, device=X_placed_mask.device) # CLS and the global features token are always real
         h_mask = torch.cat((cls_mask, X_placed_mask, X_hand_mask), dim=1)
 
         # pass through attention-MLP blocks
         for block in self.blocks:
             h = block(h, X_mask=h_mask)
 
-        # h is now (b, n+1, d)
+        # h is now (b, n+2, d)
         # pull out the CLS token and use it to compare
         q = h[:, 0] # (b, d)
 
-        # y_actions is [gp_id, x, y, z, rot], and we embed it to
-        # [gp_id_embedding] + [x, y, z, rot], before then embedding into another MLP
+        # y_actions is [gp_id, x, y, z, rot, points], and we embed it to
+        # [gp_id_embedding] + [x, y, z, rot, points], before then embedding into another MLP
         # this lets gp_id, a raw number, be more understandable
         y_gp_id_embedding = self.gp_id_embedder(y_actions[..., 0].long())
         y_embedded = torch.cat((y_gp_id_embedding, y_actions[..., 1:]), dim = -1)
@@ -224,7 +240,9 @@ class SetPointTransformer(nn.Module):
         preds = self.value_head(pooled).squeeze(-1) # (b, 1) -> (b,)
 
         # squeezes so (b, m, d) @ (b, d) becomes (b, m, d) @ (b, d, 1)
-        logits = (y_h @ q.unsqueeze(2)).squeeze(2) # logits = (b, m)
+        # / sqrt(d) like attention: y_h and q are layer-normed, so the raw dot product is ~±d and one
+        # optimizer step could swing the policy wildly (runs collapsed to scoring 0 from scratch)
+        logits = (y_h @ q.unsqueeze(2)).squeeze(2) / math.sqrt(self.block_dim) # logits = (b, m)
 
         # apply the mask: Discard garbage actions, setting them to -inf for softmax
         logits = logits.masked_fill(~y_actions_mask, float("-inf"))

@@ -9,11 +9,14 @@ Runs a batch of B games. Every call works on all B games at once.
     obs = env.observe()                  # next observation
     ...
 
-Each game's real rows are the first n_* rows of its slice, e.g. game i's legal actions are
-obs.actions[i, :obs.n_actions[i]]. Everything past the count is junk.
+Each game's real rows are the first n_* rows of its slice. Everything past the count is junk.
+Read them with obs.game(i) (one game, unpadded) or obs.trimmed() (all games, padded to the largest).
 
 The arrays are reused: every observe() overwrites them. Copy what you want to keep
-(e.g. obs.actions[i, :n].copy()) before calling observe() again.
+(obs.game(i, copy=True), obs.trimmed() already copies) before calling observe() again.
+
+Coordinates are relative to the city's start: the map's initial gamepiece sits at (0, 0, 0).
+This holds everywhere in this file, in observations and in load_game().
 
 A game that ends during step() is restarted right away (dones[i] is True and
 final_scores[i] is the ended game's score), so the next observe() shows a fresh game in that slot.
@@ -31,8 +34,10 @@ _LIB_PATH = Path(__file__).resolve().parent / "build" / "libffengine.dylib"
 
 PLACED_FEATURES = 18  # x, y, z, then grid cell bits 1-15 (6 faces x 2 bits, 3 block type bits)
 HAND_FEATURES = 1     # gp_id
-ACTION_FEATURES = 5   # gp_id, x, y, z, rot
-GRID_CENTER = 500     # grid coord where the city starts (GX/2 = GY/2 = GZ/2 in src/gamepiece_data.h)
+ACTION_FEATURES = 6   # gp_id, x, y, z, rot, points (exact reward of playing it now)
+# the C engine's grid coord where the city starts (GX/2 = GY/2 = GZ/2 in src/gamepiece_data.h).
+# Only this file converts; everything it hands out or takes in is relative to the start
+_GRID_CENTER = 500
 
 
 def _ptr(ctype):
@@ -52,7 +57,7 @@ def _load_lib():
         _ptr(np.float32), ctypes.c_uint32, _ptr(np.uint32),
         _ptr(np.float32), ctypes.c_uint32, _ptr(np.uint32),
         _ptr(np.float32), ctypes.c_uint32, _ptr(np.uint32),
-        _ptr(np.int32),
+        _ptr(np.int32), _ptr(np.int32), _ptr(np.int32), _ptr(np.int32),
     ]
     lib.ff_observe.restype = ctypes.c_int32
     lib.ff_step.argtypes = [ctypes.c_void_p, _ptr(np.int32), _ptr(np.int32), _ptr(np.uint8), _ptr(np.int32)]
@@ -77,11 +82,14 @@ class Observation:
     n_placed: np.ndarray   # (B,) uint32
     hand: np.ndarray       # (B, max_hand, 1) float32
     n_hand: np.ndarray     # (B,) uint32
-    actions: np.ndarray    # (B, max_actions, 5) float32
+    actions: np.ndarray    # (B, max_actions, 6) float32
     n_actions: np.ndarray  # (B,) uint32
     scores: np.ndarray     # (B,) int32, current score of each game
+    levels: np.ndarray     # (B,) int32, the last level whose threshold was passed (0 at the start)
+    threshold_prev: np.ndarray  # (B,) int32, score needed to pass that level
+    threshold_next: np.ndarray  # (B,) int32, score needed to pass the next level (deals the next hand)
 
-    def game(self, i: int):
+    def game(self, i: int, copy: bool = False):
         """
         Read game i out of the last observe(), cut down to its real rows (no junk padding).
 
@@ -90,30 +98,51 @@ class Observation:
 
         :param i: which game in the batch, 0 to B - 1
         :type i: int
+        :param copy: return copies you can keep, instead of views the next observe() overwrites
+        :type copy: bool
 
         :return: (placed, hand, actions)
             placed: every cube on game i's board, one row per cube:
                 [x, y, z, bit1, bit2, ..., bit15]
-                x, y, z are raw grid coords (the city starts at 500, 500, 500).
+                x, y, z are relative to the city's start (the initial gamepiece is at 0, 0, 0).
                 bits 1-15 are the grid cell's bits as 0/1: 6 faces x 2 bits (+X, -X, +Y, -Y, +Z, -Z),
                 then 3 block type bits. The filled bit is left out
             hand: game i's cards, one row per card: [gp_id]. Duplicate cards are separate rows
-            actions: game i's legal moves, one row per move: [gp_id, x, y, z, rot].
-                x, y, z is the gamepiece origin in raw grid coords, rot is 0-3.
+            actions: game i's legal moves, one row per move: [gp_id, x, y, z, rot, points], points = the exact reward of playing it now.
+                x, y, z is the gamepiece origin, relative to the city's start; rot is 0-3.
                 The row number is the action index you pass to step()
         :rtype: tuple[
             Float[ndarray, "n_placed 18"],
             Float[ndarray, "n_hand 1"],
-            Float[ndarray, "n_actions 5"],
+            Float[ndarray, "n_actions 6"],
         ]
-            All float32. These are views into the shared arrays, not copies: the next observe()
-            overwrites them, so .copy() anything you want to keep
+            All float32. Unless copy=True, these are views into the shared arrays: the next observe()
+            overwrites them
         """
-        return (
+        rows = (
             self.placed[i, : self.n_placed[i]],
             self.hand[i, : self.n_hand[i]],
             self.actions[i, : self.n_actions[i]],
         )
+        return tuple(r.copy() for r in rows) if copy else rows
+
+    def trimmed(self):
+        """
+        All B games at once, padded only as far as the largest game needs instead of the full
+        max_placed / max_actions rows. For a batched forward pass.
+
+        Game i's real rows are still only the first n_placed[i] / n_hand[i] / n_actions[i];
+        the rest of its rows are junk, so mask them (the n_* counts give the masks).
+
+        :return: (placed, hand, actions), copies (safe to keep or modify)
+        :rtype: tuple[
+            Float[ndarray, "B max_n_placed 18"],
+            Float[ndarray, "B max_n_hand 1"],
+            Float[ndarray, "B max_n_actions 6"],
+        ]
+        """
+        P, H, M = int(self.n_placed.max()), int(self.n_hand.max()), int(self.n_actions.max())
+        return self.placed[:, :P].copy(), self.hand[:, :H].copy(), self.actions[:, :M].copy()
 
 
 class FFEngine:
@@ -135,6 +164,9 @@ class FFEngine:
             actions=np.zeros((B, max_actions, ACTION_FEATURES), dtype=np.float32),
             n_actions=np.zeros(B, dtype=np.uint32),
             scores=np.zeros(B, dtype=np.int32),
+            levels=np.zeros(B, dtype=np.int32),
+            threshold_prev=np.zeros(B, dtype=np.int32),
+            threshold_next=np.zeros(B, dtype=np.int32),
         )
         self._rewards = np.zeros(B, dtype=np.int32)
         self._dones = np.zeros(B, dtype=np.uint8)
@@ -154,14 +186,18 @@ class FFEngine:
 
         :return: the Observation holding all B games. It's the same object every call (self.obs),
             refilled in place, so anything you kept from an earlier call gets overwritten.
-            Use obs.game(i) to get one game cut down to its real rows. Its fields are:
+            Use obs.game(i) to get one game cut down to its real rows, or obs.trimmed() for a padded batch.
+            Coordinates are relative to the city's start (0, 0, 0). Its fields are:
                 placed:    (B, max_placed, 18) float32. Each game's board cubes; see Observation.game
                 n_placed:  (B,) uint32. How many rows of placed[i] are real
                 hand:      (B, max_hand, 1) float32. Each game's cards as [gp_id]
                 n_hand:    (B,) uint32. How many rows of hand[i] are real
-                actions:   (B, max_actions, 5) float32. Each game's legal moves as [gp_id, x, y, z, rot]
+                actions:   (B, max_actions, 6) float32. Each game's legal moves as [gp_id, x, y, z, rot, points]
                 n_actions: (B,) uint32. How many rows of actions[i] are real. Always >= 1
                 scores:    (B,) int32. Each game's current score
+                levels:    (B,) int32. The last level whose threshold was passed (0 at the start)
+                threshold_prev, threshold_next: (B,) int32. Score needed to pass that level and the next one;
+                           threshold_prev <= score < threshold_next, and crossing threshold_next deals the next hand
             Rows past the n_* counts are junk.
         :rtype: Observation
 
@@ -173,10 +209,13 @@ class FFEngine:
             o.placed, o.placed.shape[1], o.n_placed,
             o.hand, o.hand.shape[1], o.n_hand,
             o.actions, o.actions.shape[1], o.n_actions,
-            o.scores,
+            o.scores, o.levels, o.threshold_prev, o.threshold_next,
         )
         if truncated:
             raise RuntimeError("observation buffer too small; raise max_placed / max_actions")
+        # C writes raw grid coords; shift the real rows so the city's start is (0, 0, 0)
+        o.placed[:, : int(o.n_placed.max()), 0:3] -= _GRID_CENTER   # placed: [x, y, z, bits...]
+        o.actions[:, : int(o.n_actions.max()), 1:4] -= _GRID_CENTER  # actions: [gp_id, x, y, z, rot, points]
         return o
 
     def step(self, action_idx):
@@ -216,14 +255,16 @@ class FFEngine:
         Call observe() afterwards to see it.
 
         :param game: which slot, 0 to B - 1
-        :param pieces: every piece placed so far, in order, as rows of [gp_id, rot, x, y, z] (raw grid
-            coords). Leave out the map's initial gamepiece: every game already starts with it
+        :param pieces: every piece placed so far, in order, as rows of [gp_id, rot, x, y, z], with x, y, z
+            relative to the initial gamepiece (like observations). Leave out the map's initial gamepiece:
+            every game already starts with it
         :param hand: the gp_ids in hand. These replace whatever hand the engine dealt itself
         :return: the score the engine gives those placements
 
         :raises ValueError: a piece is out of range, or isn't a legal placement where it is
         """
-        p = np.ascontiguousarray(pieces, dtype=np.int32).reshape(-1, 5)
+        p = np.array(pieces, dtype=np.int32).reshape(-1, 5)  # a copy, so the caller's pieces aren't shifted
+        p[:, 2:5] += _GRID_CENTER
         h = np.ascontiguousarray(hand, dtype=np.int32).reshape(-1)
         result = _lib.ff_load_game(self._batch, game, p, len(p), h, len(h))
         errors = {-1: "game slot out of range", -2: "a piece's gp_id, rot or position is out of range",
