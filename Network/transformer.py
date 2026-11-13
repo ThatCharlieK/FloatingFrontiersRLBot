@@ -123,6 +123,7 @@ class SetPointTransformer(nn.Module):
 
         self.score_blocks = nn.ModuleList([MultiHeadAttentionMLPBlock(block_dim, cross_attend_q=True) for _ in range(num_score_blocks)])
         self.score_layer = nn.Linear(self.block_dim + 5, block_dim) # gp_id embedding + [x, y, z, rot, points]
+        self.hand_layer = nn.Linear(self.block_dim + 3, block_dim) # gp_id embedding + [legal placements, best points, scoring placements]
         
         """
         Classification token:
@@ -152,7 +153,7 @@ class SetPointTransformer(nn.Module):
         # in the second slot next to the cls token. This way the model can learn with
         # global game state information during atttention
         self.global_features_layer = nn.Sequential(
-                    nn.Linear(3, block_dim),
+                    nn.Linear(4, block_dim), # [score, points until next level, level index, cards in hand]
                     nn.ReLU(),
                     nn.Linear(block_dim, block_dim)
                 )
@@ -171,8 +172,9 @@ class SetPointTransformer(nn.Module):
         :param X_placed_mask: Each batch has a different number of placed cubes,
         so X_placed_mask is bool with true for real token, false for garbage
 
-        :param X_hand: Gamepiece Ids in the hand
-        :type X: Float[Tensor, "b, n 1"]
+        :param X_hand: The cards in the hand, each (gamepiece_id, legal placements, best immediate points, scoring placements),
+        the last 3 pre-scaled (see train.py)
+        :type X: Float[Tensor, "b, n 4"]
 
         :param X_hand_mask: Each batch has a different number of hands,
         so X_placed_mask is bool with true for real token, false for garbage
@@ -187,7 +189,7 @@ class SetPointTransformer(nn.Module):
                         we must pad to -inf so that we don't use the junk values.
 
         :param global_features: Global features about the game, projected into a single token.
-        (b, 3), each row is [score, points until next level, level index], pre-scaled to small numbers (see train.py)
+        (b, 4), each row is [score, points until next level, level index, cards in hand], pre-scaled to small numbers (see train.py)
                         
         
         :return: Two tensors:
@@ -196,13 +198,13 @@ class SetPointTransformer(nn.Module):
         :rtype: tensors
         """
 
-        # project placed (n, 18) and (n, 1) to same dimensions
+        # project placed (n, 18) and hand (n, 4) to same dimensions
         n_batch = X_placed.size(0)
 
         h_placed = self.placed_input_layer(X_placed)
-        h_hand = self.gp_id_embedder(X_hand[..., 0].long())
+        h_hand = self.hand_layer(torch.cat((self.gp_id_embedder(X_hand[..., 0].long()), X_hand[..., 1:]), dim = -1))
         cls = self.CLS_token.expand(n_batch, -1, -1) # copy cls along batch dim
-        global_feat = self.global_features_layer(global_features).unsqueeze(1) # (b, 3) -> (b, 1, d)
+        global_feat = self.global_features_layer(global_features).unsqueeze(1) # (b, 4) -> (b, 1, d)
         h = torch.cat((cls, global_feat, h_placed, h_hand), dim = 1)
 
         cls_mask = torch.ones(n_batch, 2, dtype=torch.bool, device=X_placed_mask.device) # CLS and the global features token are always real

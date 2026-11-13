@@ -66,12 +66,24 @@ VALUE_SCALE = 100
 
 def global_features(obs: Observation) -> np.ndarray:
     """
-    (B, 3) float32 [score, points until next level, level index] of every game, scaled to small numbers
+    (B, 4) float32 [score, points until next level, level index, cards in hand] of every game, scaled to small numbers
     so they don't swamp the model's global features token (scores run into the hundreds, gaps into the tens)
     """
     return np.stack([obs.scores / 100,
                      (obs.threshold_next - obs.scores) / 10,
-                     obs.levels / 10], axis=1).astype(np.float32)
+                     obs.levels / 10,
+                     obs.n_hand / 10], axis=1).astype(np.float32)
+
+def scale_hand_features(hand: torch.Tensor) -> torch.Tensor:
+    """
+    Scale a (b, n, 4) hand batch [gp_id, legal placements, best points, scoring placements] in place, and return it.
+    The counts run from 0 to the thousands, but the difference between 0, 1 and 5 placements (a dead or
+    nearly dead card) matters far more than 500 vs 1000, so they go through log(1 + x)
+    """
+    hand[..., 1] = torch.log1p(hand[..., 1])
+    hand[..., 2] /= 10 # points, scaled like the actions' points
+    hand[..., 3] = torch.log1p(hand[..., 3])
+    return hand
 
 SHAPE_BIN_RATIO = 1.4 # measured: 1.3-1.4 minimizes epoch time (smaller = less padding, but more, smaller buckets)
 
@@ -101,7 +113,7 @@ class forward_pass_result:
     :param pred_reward_to_go: A predicted reward_to_go that the model predicts for this action
     :param advantage: GAE advantage: TD errors of this and later moves, faded by LAMBDA
     :param compute_required: An estimate of the compute required to run this forward pass
-    :param global_feats: global_features() of this state, (3,)
+    :param global_feats: global_features() of this state, (4,)
     """
     placed: np.ndarray
     hand: np.ndarray
@@ -123,7 +135,7 @@ class ModelInputs(NamedTuple):
     hand_mask: torch.Tensor
     actions: torch.Tensor
     actions_mask: torch.Tensor
-    global_feats: torch.Tensor  # (B, 3), see global_features()
+    global_feats: torch.Tensor  # (B, 4), see global_features()
 
 def get_batch_state_from_obs(obs: Observation, device: torch.device) -> ModelInputs:
     """
@@ -140,7 +152,7 @@ def get_batch_state_from_obs(obs: Observation, device: torch.device) -> ModelInp
     raw_placed_batch, raw_hand_batch, raw_actions_batch = obs.trimmed()
     placed = torch.from_numpy(raw_placed_batch).to(device)
     placed_mask = lengths_to_mask(obs.n_placed, raw_placed_batch.shape[1], device)
-    hand = torch.from_numpy(raw_hand_batch).to(device)
+    hand = scale_hand_features(torch.from_numpy(raw_hand_batch).to(device))
     hand_mask = lengths_to_mask(obs.n_hand, raw_hand_batch.shape[1], device)
     raw_actions_batch[..., 5] /= 10  # points this move would score now (usually 0-20), scaled like the global features
     actions = torch.from_numpy(raw_actions_batch).to(device)
@@ -161,6 +173,7 @@ def get_batch_state_from_records(records: list[forward_pass_result], device: tor
     """
     placed, placed_mask = pad_batch([r.placed for r in records], device)
     hand, hand_mask = pad_batch([r.hand for r in records], device)
+    scale_hand_features(hand) # same scaling as get_batch_state_from_obs (records store raw counts)
     actions, actions_mask = pad_batch([r.actions for r in records], device)
     actions[..., 5] /= 10  # same points scaling as get_batch_state_from_obs (records store raw points)
     global_feats = torch.from_numpy(np.stack([r.global_feats for r in records])).to(device)

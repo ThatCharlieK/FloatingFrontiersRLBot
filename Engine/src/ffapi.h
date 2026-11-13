@@ -24,8 +24,8 @@ holds a live game. ff_step flags it in dones and reports its final score.
 */
 
 #define FF_PLACED_FEATURES 18 // x, y, z, then grid cell bits 1-15 (faces and block type) as 0/1. the filled bit is left out
-#define FF_HAND_FEATURES 1    // gp_id
-#define FF_ACTION_FEATURES 5  // gp_id, x, y, z, rot
+#define FF_HAND_FEATURES 4    // gp_id, legal placements, best immediate points, scoring placements (the last 3 over this card's legal actions)
+#define FF_ACTION_FEATURES 6  // gp_id, x, y, z, rot, points (what playing it would score right now)
 
 typedef struct FFBatch FFBatch;
 
@@ -41,7 +41,11 @@ Write the current observation of every game. Game i's rows start at i * max_<buf
     placed:  (B, max_placed, FF_PLACED_FEATURES)   n_placed:  (B,)
     hand:    (B, max_hand, FF_HAND_FEATURES)        n_hand:    (B,)
     actions: (B, max_actions, FF_ACTION_FEATURES)   n_actions: (B,)
+             each row is [gp_id, x, y, z, rot, points]. points is exactly the reward ff_step returns for that action
     scores:  (B,) current score
+    levels:  (B,) the last level whose threshold was passed (0 at the start of a game)
+    threshold_prev, threshold_next: (B,) score needed to pass that level, and the next one.
+             threshold_prev <= score < threshold_next; crossing threshold_next deals the next hand
 Rows past the count are left untouched (junk).
 Coordinates are raw grid coordinates (the city starts at the grid center, GX/2, GY/2, GZ/2).
 Returns 0, or 1 if some buffer was too small (that game's rows were cut off at max_*).
@@ -50,7 +54,7 @@ int32_t ff_observe(FFBatch* batch,
                    float* placed, uint32_t max_placed, uint32_t* n_placed,
                    float* hand, uint32_t max_hand, uint32_t* n_hand,
                    float* actions, uint32_t max_actions, uint32_t* n_actions,
-                   int32_t* scores);
+                   int32_t* scores, int32_t* levels, int32_t* threshold_prev, int32_t* threshold_next);
 
 /*
 Play action_idx[i] (an index into game i's legal actions from the last ff_observe) in every game.

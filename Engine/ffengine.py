@@ -33,7 +33,7 @@ import numpy as np
 _LIB_PATH = Path(__file__).resolve().parent / "build" / "libffengine.dylib"
 
 PLACED_FEATURES = 18  # x, y, z, then grid cell bits 1-15 (6 faces x 2 bits, 3 block type bits)
-HAND_FEATURES = 1     # gp_id
+HAND_FEATURES = 4     # gp_id, legal placements, best immediate points, scoring placements (over that card's legal actions)
 ACTION_FEATURES = 6   # gp_id, x, y, z, rot, points (exact reward of playing it now)
 # the C engine's grid coord where the city starts (GX/2 = GY/2 = GZ/2 in src/gamepiece_data.h).
 # Only this file converts; everything it hands out or takes in is relative to the start
@@ -80,7 +80,7 @@ NUM_GAMEPIECES = _lib.ff_num_gamepieces()
 class Observation:
     placed: np.ndarray     # (B, max_placed, 18) float32
     n_placed: np.ndarray   # (B,) uint32
-    hand: np.ndarray       # (B, max_hand, 1) float32
+    hand: np.ndarray       # (B, max_hand, 4) float32
     n_hand: np.ndarray     # (B,) uint32
     actions: np.ndarray    # (B, max_actions, 6) float32
     n_actions: np.ndarray  # (B,) uint32
@@ -107,13 +107,15 @@ class Observation:
                 x, y, z are relative to the city's start (the initial gamepiece is at 0, 0, 0).
                 bits 1-15 are the grid cell's bits as 0/1: 6 faces x 2 bits (+X, -X, +Y, -Y, +Z, -Z),
                 then 3 block type bits. The filled bit is left out
-            hand: game i's cards, one row per card: [gp_id]. Duplicate cards are separate rows
+            hand: game i's cards, one row per card: [gp_id, legal placements, best immediate points, scoring placements].
+                The last 3 are over that card's legal actions: how many there are, the most points one of them
+                scores right now, and how many score > 0. Duplicate cards are separate rows with the same stats
             actions: game i's legal moves, one row per move: [gp_id, x, y, z, rot, points], points = the exact reward of playing it now.
                 x, y, z is the gamepiece origin, relative to the city's start; rot is 0-3.
                 The row number is the action index you pass to step()
         :rtype: tuple[
             Float[ndarray, "n_placed 18"],
-            Float[ndarray, "n_hand 1"],
+            Float[ndarray, "n_hand 4"],
             Float[ndarray, "n_actions 6"],
         ]
             All float32. Unless copy=True, these are views into the shared arrays: the next observe()
@@ -137,7 +139,7 @@ class Observation:
         :return: (placed, hand, actions), copies (safe to keep or modify)
         :rtype: tuple[
             Float[ndarray, "B max_n_placed 18"],
-            Float[ndarray, "B max_n_hand 1"],
+            Float[ndarray, "B max_n_hand 4"],
             Float[ndarray, "B max_n_actions 6"],
         ]
         """
@@ -190,7 +192,7 @@ class FFEngine:
             Coordinates are relative to the city's start (0, 0, 0). Its fields are:
                 placed:    (B, max_placed, 18) float32. Each game's board cubes; see Observation.game
                 n_placed:  (B,) uint32. How many rows of placed[i] are real
-                hand:      (B, max_hand, 1) float32. Each game's cards as [gp_id]
+                hand:      (B, max_hand, 4) float32. Each game's cards as [gp_id, legal placements, best points, scoring placements]
                 n_hand:    (B,) uint32. How many rows of hand[i] are real
                 actions:   (B, max_actions, 6) float32. Each game's legal moves as [gp_id, x, y, z, rot, points]
                 n_actions: (B,) uint32. How many rows of actions[i] are real. Always >= 1
