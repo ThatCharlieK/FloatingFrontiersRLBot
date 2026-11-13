@@ -31,6 +31,10 @@ from checkpoint import TrainingTracker
 from dataclasses import dataclass, field
 import numpy as np
 
+ # max compute_cost() of one padded bucket. memory on mps is ~1.3-2.1 GB per 1M units
+SCALED_COMPUTE_BUDGET = 1000000 # measured: the gpu saturates at ~0.5-1M per bucket, bigger only adds padding (~5 GB peak)
+LAMBDA = 0.9 # GAE: how fast later moves' surprises fade from a move's advantage (1 = reward_to_go - pred, 0 = TD error only). no discount (gamma = 1)
+
 def lengths_to_mask(lengths, max_len: int, device: torch.device) -> torch.Tensor:
     """(B,) per-game row counts -> (B, max_len) bool mask on device, True for each game's first lengths[i] rows"""
     return (torch.arange(max_len)[None, :] < torch.from_numpy(lengths.astype("int64"))[:, None]).to(device)
@@ -95,6 +99,7 @@ class forward_pass_result:
     :param immediate_reward: The immediate point value gained from placing that action
     :param reward_to_go: Score at end of game - score at current state
     :param pred_reward_to_go: A predicted reward_to_go that the model predicts for this action
+    :param advantage: GAE advantage: TD errors of this and later moves, faded by LAMBDA
     :param compute_required: An estimate of the compute required to run this forward pass
     :param global_feats: global_features() of this state, (3,)
     """
@@ -106,6 +111,7 @@ class forward_pass_result:
     immediate_reward: int
     reward_to_go: int
     pred_reward_to_go: float
+    advantage: float
     compute_required: float
     global_feats: np.ndarray
 
@@ -136,6 +142,7 @@ def get_batch_state_from_obs(obs: Observation, device: torch.device) -> ModelInp
     placed_mask = lengths_to_mask(obs.n_placed, raw_placed_batch.shape[1], device)
     hand = torch.from_numpy(raw_hand_batch).to(device)
     hand_mask = lengths_to_mask(obs.n_hand, raw_hand_batch.shape[1], device)
+    raw_actions_batch[..., 5] /= 10  # points this move would score now (usually 0-20), scaled like the global features
     actions = torch.from_numpy(raw_actions_batch).to(device)
     actions_mask = lengths_to_mask(obs.n_actions, raw_actions_batch.shape[1], device)
     global_feats = torch.from_numpy(global_features(obs)).to(device)
@@ -155,6 +162,7 @@ def get_batch_state_from_records(records: list[forward_pass_result], device: tor
     placed, placed_mask = pad_batch([r.placed for r in records], device)
     hand, hand_mask = pad_batch([r.hand for r in records], device)
     actions, actions_mask = pad_batch([r.actions for r in records], device)
+    actions[..., 5] /= 10  # same points scaling as get_batch_state_from_obs (records store raw points)
     global_feats = torch.from_numpy(np.stack([r.global_feats for r in records])).to(device)
 
     return ModelInputs(placed, placed_mask, hand, hand_mask, actions, actions_mask, global_feats)
@@ -200,7 +208,7 @@ def get_game_choices(model: transformer.SetPointTransformer, env: FFEngine, n_ta
                 compute_required = compute_cost(len(placed), len(hand), len(actions), model)
                 # immediate_reward and reward_to_go aren't known yet: filled in after env.step / when the game ends
                 in_progress[i].append(forward_pass_result(placed, hand, actions, action_idx, old_log_prob,
-                                                          immediate_reward=0, reward_to_go=0,
+                                                          immediate_reward=0, reward_to_go=0, advantage=0,
                                                           pred_reward_to_go=preds[i].item() * VALUE_SCALE,
                                                           compute_required=compute_required,
                                                           global_feats=global_b[i]))
@@ -213,16 +221,56 @@ def get_game_choices(model: transformer.SetPointTransformer, env: FFEngine, n_ta
 
                 if dones[i]:
                     total_game_scores += final_scores[i]
-                    # return to go: walk the game backwards, keeping a running sum of rewards
-                    g = 0
+                    # walk the game backwards, keeping running sums:
+                    #   g: return to go, the sum of rewards from this move on
+                    #   gae: this move's TD error + LAMBDA * the next move's gae, so the next move's surprise counts LAMBDA,
+                    #        the one after LAMBDA^2, ... (one pass instead of re-summing the rest of the game per move)
+                    # next_pred is V(s_t+1), the value head's prediction at the next state; 0 after the last move
+                    g, gae, next_pred = 0, 0.0, 0.0
                     for record in reversed(in_progress[i]):
                         g += record.immediate_reward
                         record.reward_to_go = g
+                        td_error = record.immediate_reward + next_pred - record.pred_reward_to_go
+                        gae = td_error + LAMBDA * gae
+                        record.advantage = gae
+                        next_pred = record.pred_reward_to_go
                     finished.extend(in_progress[i])
                     n_finished_games += 1
                     in_progress[i] = []         # a new game already started in this slot
     return (finished, total_game_scores / n_finished_games)
 
+def sort_into_compute_buckets(forward_results: list[forward_pass_result], model: transformer.SetPointTransformer) -> list[list[forward_pass_result]]:
+    """
+    maximize compute by sorting forward_results into buckets with similar size tokens, so that
+    padding is similar size and there aren't early game (10+ tok) and late games (10k+ tok)
+    mixed together, since that would waste most compute on padding
+
+    """
+    # sort by shape bin, then compute required
+    forward_results.sort(key = lambda res: (shape_bin(res), res.compute_required))
+    # maximize compute by sorting into buckets where each bucket is the max
+    # that can be batched at once
+    
+    # sort each game-action pair from forward_results into buckets,
+    # each taking the max amount of compute less than scaled_compute_budget
+    # We batch over buckets so that each bucket has the max number of tokens it can handle
+    buckets: list[list[forward_pass_result]] = [[]]
+    bucket_i = 0
+    P = H = M = 0 # the current bucket's padded sizes
+    for res in forward_results:
+        # because of padding, every element in a bucket costs the same: pad_batch pads placed, hand
+        # and actions each to their own max over the bucket, so a bucket costs
+        # len(bucket) * compute_cost(max placed, max hand, max actions)
+        p, h, m = max(P, len(res.placed)), max(H, len(res.hand)), max(M, len(res.actions))
+        # start a new bucket at each new shape bin, or when the padded bucket would go over budget
+        if buckets[bucket_i] and (shape_bin(res) != shape_bin(buckets[bucket_i][-1])
+                                    or (len(buckets[bucket_i]) + 1) * compute_cost(p, h, m, model) > SCALED_COMPUTE_BUDGET):
+            bucket_i += 1
+            buckets.append([])
+            p, h, m = len(res.placed), len(res.hand), len(res.actions)
+        P, H, M = p, h, m
+        buckets[bucket_i].append(res)
+    return buckets
 
 def train():
     torch.set_num_threads(1) # measured for empirical speedup
@@ -235,14 +283,12 @@ def train():
     env = FFEngine(n_games, seed = 0)
     num_update_steps = 10000
     games_played_per_update_step = 60
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4) # from scratch; target_kl keeps single updates from swinging the policy
     B = 0.01
     n_epochs = 4      # PPO: update passes over each batch of games, instead of 1
     clip_eps = 0.2    # PPO: each move's probability may move at most ~20% per batch
+    target_kl = 0.02  # PPO: stop this batch's epochs early once the policy has moved this far from the one that played
     value_coef = 0.5  # weight of the value head's loss against the policy loss
-
-    # max compute_cost() of one padded bucket. memory on mps is ~1.3-2.1 GB per 1M units
-    scaled_compute_budget = 1000000 # measured: the gpu saturates at ~0.5-1M per bucket, bigger only adds padding (~5 GB peak)
 
     # live plot of the average final game score per update step. ion() = interactive mode, so the
     # window redraws during training instead of blocking until the end
@@ -257,46 +303,18 @@ def train():
 
     for step in range(num_update_steps):
         forward_results, average_score = get_game_choices(model, env, games_played_per_update_step)
-        # advantage of each move: g_t - pred_g_t. Normalized over the whole batch, so the policy loss
+        # advantage of each move (GAE, see get_game_choices). Normalized over the whole batch, so the policy loss
         # stays around +-1 whatever the score scale
-        advantages = torch.tensor([r.reward_to_go - r.pred_reward_to_go for r in forward_results], dtype = torch.float)
+        advantages = torch.tensor([r.advantage for r in forward_results], dtype = torch.float)
         adv_mean, adv_std = advantages.mean().item(), advantages.std().item()
 
-        # maximize compute by sorting forward_results into buckets with similar size tokens, so that
-        # padding is similar size and there aren't early game (10+ tok) and late games (10k+ tok)
-        # mixed together, since that would waste most compute on padding
-
-        # sort by shape bin, then compute required
-        forward_results.sort(key = lambda res: (shape_bin(res), res.compute_required))
-
-        # maximize compute by sorting into buckets where each bucket is the max
-        # that can be batched at once
-        
-        # sort each game-action pair from forward_results into buckets,
-        # each taking the max amount of compute less than scaled_compute_budget
-        # We batch over buckets so that each bucket has the max number of tokens it can handle
-        buckets: list[list[forward_pass_result]] = [[]]
-        bucket_i = 0
-        P = H = M = 0 # the current bucket's padded sizes
-        for res in forward_results:
-            # because of padding, every element in a bucket costs the same: pad_batch pads placed, hand
-            # and actions each to their own max over the bucket, so a bucket costs
-            # len(bucket) * compute_cost(max placed, max hand, max actions)
-            p, h, m = max(P, len(res.placed)), max(H, len(res.hand)), max(M, len(res.actions))
-            # start a new bucket at each new shape bin, or when the padded bucket would go over budget
-            if buckets[bucket_i] and (shape_bin(res) != shape_bin(buckets[bucket_i][-1])
-                                      or (len(buckets[bucket_i]) + 1) * compute_cost(p, h, m, model) > scaled_compute_budget):
-                bucket_i += 1
-                buckets.append([])
-                p, h, m = len(res.placed), len(res.hand), len(res.actions)
-            P, H, M = p, h, m
-            buckets[bucket_i].append(res)
-
+        buckets = sort_into_compute_buckets(forward_results, model)
 
         # wrap in n_epochs to allow for PPO updating, capping the amount that
         # probailities shift to 20% with each gameplay batch
-        for _ in range(n_epochs):
+        for epoch in range(n_epochs):
             optimizer.zero_grad()
+            approx_kl = 0.0 # mean (old log prob - new log prob) of the played moves: how far the policy has moved
 
             # average gradients
             for bucket in buckets:
@@ -305,14 +323,31 @@ def train():
                 inputs = get_batch_state_from_records(bucket, device)
                 log_probs, cur_pred = model.forward(*inputs) # (b, M)
 
+                """
+                Use g_t prediction for better reward:
 
-                # g_t := difference from current action to end game score.
-                # One way to train is (g_t - end score), but that puts early actions at >100
-                # and late actions at <10. Thats not a good signal for the model
-                # instead we train with (g_t - pred_g_t), where the model also learns to predict the
-                # predicted g_t at this point. If (g_t - pred_g_t) is high, that means the
-                # move was a better move than normal
-                g_t_diff = (torch.tensor([r.reward_to_go - r.pred_reward_to_go for r in bucket], dtype=torch.float, device=device) - adv_mean) / (adv_std + 1e-8)
+                reward_to_go := difference from current action to end game score.
+                One way to train is (reward_to_go - end score), but that puts early actions at >100
+                and late actions at <10. Thats not a good signal for the model
+                instead we train with (reward_to_go - pred_reward_to_go), where the model also learns to predict the
+                predicted g_t at this point. If (reward_to_go - pred_reward_to_go) is high, that means the
+                move was a better move than normal
+
+                Also use gae for even better g_t:
+                (reward_to_go - pred_reward_to_go) fixes the high vs low disparity, but reward_to_go
+                still is noisey since reward_to_go includes blunders and mistakes from later in the game.
+
+                To fix, let compute the prediction at the current state, and at the current state s_t,
+                and at s_t+1, which is the state after the current action, and compute:
+                TD_error = reward + (next_pred_reward_to_go - pred_reward_to_go)
+                
+                Ex: if next_pred_reward_to_go is 310, and pred_reward_to_go is 300, and the action, reward, scored 4 pints, 
+                then the action placed generated 10 + 4 = 14 more points than expected. TD_error is then a better indicator
+
+                Except don't use this approach fully, instead, fade it out
+
+                """
+                g_t_diff = (torch.tensor([r.advantage for r in bucket], dtype=torch.float, device=device) - adv_mean) / (adv_std + 1e-8)
 
                 # entropy loss: incenitivze not being too confident around one decision
                 # padded actions have log prob -inf; zero them so 0 * -inf doesn't give nan
@@ -345,8 +380,13 @@ def train():
                 
                 cur_loss = policy_loss - B * entropy + value_coef * pred_loss
 
+                approx_kl += (old_prob - new_prob).sum().item() / len(forward_results)
 
                 (cur_loss.sum() / len(forward_results)).backward() # compute averaged gradients
+
+            # the clip alone can't stop a big jump, since it only acts on moves already past 20%
+            if approx_kl > target_kl:
+                break
 
             # step based on average gradients
             optimizer.step()
